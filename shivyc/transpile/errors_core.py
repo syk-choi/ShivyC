@@ -63,9 +63,24 @@ class ErrorCollector:
 
 
 error_collector: ErrorCollector | None = None
+shivycx_pending_error: CompilerError | None = None
 
 
 def init_errors_core() -> None:
     """Initialize module globals (call once at startup)."""
     global error_collector
     error_collector = ErrorCollector()
+
+
+def clear_pending_error() -> None:
+    """Clear the pending compiler error, if any."""
+    global shivycx_pending_error
+    shivycx_pending_error = None
+
+
+def take_pending_error() -> CompilerError | None:
+    """Return and clear the pending compiler error."""
+    global shivycx_pending_error
+    err: CompilerError | None = shivycx_pending_error
+    shivycx_pending_error = None
+    return err

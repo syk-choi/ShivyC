@@ -187,10 +187,6 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             elif isinstance(item, ast.ClassDef):
                 self.visit(item)
 
-        if self.module_name == "errors_core":
-            self.emit("CompilerError *shivycx_pending_error = NULL;")
-            self.emit("")
-
         for item in node.body:
             if isinstance(item, ast.FunctionDef):
                 self.at_module_level = False
@@ -1085,10 +1081,14 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                     return f"({left} > {right})"
                 if isinstance(op, ast.GtE):
                     return f"({left} >= {right})"
-                if isinstance(op, ast.Is):
-                    return f"({left} == {right})"
                 if isinstance(op, ast.IsNot):
+                    if isinstance(comparator, ast.Constant) and comparator.value is None:
+                        return f"({left} != NULL)"
                     return f"({left} != {right})"
+                if isinstance(op, ast.Is):
+                    if isinstance(comparator, ast.Constant) and comparator.value is None:
+                        return f"({left} == NULL)"
+                    return f"({left} == {right})"
                 left = right
             return left
 
@@ -1120,6 +1120,11 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                     if base == "IntList":
                         return f"IntList_push({list_name}, {self.to_c_expr(node.args[0])})"
                     return self.list_op(base, "push", list_name, self.to_c_expr(node.args[0]))
+            if node.func.attr == "extend" and isinstance(node.func.value, ast.Name):
+                list_name = node.func.value.id
+                base = self.list_base(node.func.value)
+                if base != "Unknown":
+                    return self.list_op(base, "extend", list_name, self.to_c_expr(node.args[0]))
             if node.func.attr == "isspace":
                 obj = self.to_c_expr(node.func.value)
                 return f"isspace((unsigned char)({obj}[0]))"

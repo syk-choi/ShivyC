@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from shivyc.transpile.errors_core import CompilerError, Position, Range, Tagged, error_collector
+from shivyc.transpile.errors_core import (
+    CompilerError,
+    Position,
+    Range,
+    Tagged,
+    clear_pending_error,
+    error_collector,
+    take_pending_error,
+)
 import shivyc.transpile.token_kinds as token_kinds
 from shivyc.transpile.regex_helpers import (
     float_const_fullmatch,
@@ -402,6 +410,32 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
         read_include_filename(line, chunk_end)
 
     return tokens, in_comment
+
+
+def tokenize(code: str, filename: str) -> list[Token]:
+    """Convert source text into a flat list of tokens."""
+    tokens: list[Token] = []
+    lines: list[list[Tagged]] = split_to_tagged_lines(code, filename)
+    join_extended_lines(lines)
+    in_comment: bool = False
+    logical_line: int = 0
+    while logical_line < len(lines):
+        line: list[Tagged] = lines[logical_line]
+        clear_pending_error()
+        line_tokens: list[Token]
+        line_tokens, in_comment = tokenize_line(line, in_comment)
+        err: CompilerError | None = take_pending_error()
+        if err is not None:
+            error_collector.add(err)
+        else:
+            t_idx: int = 0
+            while t_idx < len(line_tokens):
+                tok: Token = line_tokens[t_idx]
+                tok.logical_line = logical_line
+                t_idx = t_idx + 1
+            tokens.extend(line_tokens)
+        logical_line = logical_line + 1
+    return tokens
 
 
 def tokenize_text_line(text: str, filename: str, in_comment: bool) -> tuple[list[Token], bool]:

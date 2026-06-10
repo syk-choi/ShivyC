@@ -37,8 +37,11 @@ struct CompilerError {
 };
 
 extern ErrorCollector *error_collector;
+extern CompilerError *shivycx_pending_error;
 
 void init_errors_core(void);
+void clear_pending_error(void);
+CompilerError *take_pending_error(void);
 
 Position *Position_new(const char *file, int line, int col, const char *full_line);
 Range *Range_new(Position *start, Position *end);
