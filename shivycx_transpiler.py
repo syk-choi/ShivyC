@@ -838,6 +838,11 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         return f"{fn}({', '.join(args)})"
 
     def list_len(self, node: ast.expr) -> str:
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in self.imported_modules:
+                attr = node.attr
+                if attr in ("symbol_kinds", "keyword_kinds"):
+                    return f"(int)TokenKindList_len({attr})"
         if isinstance(node, ast.Name):
             c_type = self.scope.get_type(node.id) or ""
             if c_type == "const char*":

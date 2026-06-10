@@ -403,3 +403,12 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
 
     return tokens, in_comment
 
+
+def tokenize_text_line(text: str, filename: str, in_comment: bool) -> tuple[list[Token], bool]:
+    """Tokenize a single source line given as raw text."""
+    tagged_lines: list[list[Tagged]] = split_to_tagged_lines(text, filename)
+    if len(tagged_lines) > 0:
+        return tokenize_line(tagged_lines[0], in_comment)
+    tokens: list[Token] = []
+    return tokens, in_comment
+
