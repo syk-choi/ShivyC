@@ -7,7 +7,7 @@ from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
 from shivyc.tree.utils import (IndirectLValue, DirectLValue, RelativeLValue,
-                               get_size)
+                               BitFieldLValue, get_size)
 
 
 class AddrOf(_RExprNode):
@@ -22,6 +22,22 @@ class AddrOf(_RExprNode):
         """Make code for this node."""
         lvalue = self.expr.lvalue(il_code, symbol_table, c)
         if lvalue:
+            # If a tracked string-pointer's address is taken, it could be
+            # mutated through that pointer, so stop trusting its length.
+            import shivyc.tree.primary_exprs as _pe
+            if isinstance(self.expr, _pe.Identifier):
+                import shivyc.contracts as _contracts
+                try:
+                    _contracts.clear_known_len(
+                        symbol_table.lookup_variable(self.expr.identifier))
+                except CompilerError:
+                    pass
+            # Taking the address of a struct lets its bytes escape tracked
+            # member access (memcpy, casts, I/O), so it must keep all members.
+            obj_ctype = lvalue.ctype()
+            if obj_ctype and obj_ctype.is_struct_union():
+                import shivyc.member_elim as member_elim
+                member_elim.mark_ineligible(getattr(obj_ctype, "tag", None))
             return lvalue.addr(il_code)
         else:
             err = "operand of unary '&' must be lvalue"
@@ -160,6 +176,11 @@ class _ObjLookup(_LExprNode):
             err = "request for member in something not a structure or union"
             raise CompilerError(err, self.r)
 
+        # Record the access for the whole-program unused-member analysis.
+        import shivyc.member_elim as member_elim
+        member_elim.record_access(
+            getattr(struct_ctype, "tag", None), self.member.content)
+
         offset, ctype = struct_ctype.get_offset(self.member.content)
         if offset is None:
             err = f"structure or union has no member '{self.member.content}'"
@@ -169,6 +190,14 @@ class _ObjLookup(_LExprNode):
             ctype = ctype.make_const()
 
         return offset, ctype
+
+    def _wrap_bitfield(self, base_lvalue, struct_ctype):
+        """Wrap an lvalue in a BitFieldLValue if the member is a bitfield."""
+        info = struct_ctype.get_bitfield(self.member.content)
+        if info is None:
+            return base_lvalue
+        width, signed = info
+        return BitFieldLValue(base_lvalue, width, signed)
 
 
 class ObjMember(_ObjLookup):
@@ -181,7 +210,7 @@ class ObjMember(_ObjLookup):
 
         if isinstance(head_lv, DirectLValue):
             head_val = self.head.make_il(il_code, symbol_table, c)
-            return RelativeLValue(ctype, head_val, offset)
+            base = RelativeLValue(ctype, head_val, offset)
         else:
             struct_addr = head_lv.addr(il_code)
 
@@ -190,7 +219,9 @@ class ObjMember(_ObjLookup):
 
             out = ILValue(PointerCType(ctype))
             il_code.add(math_cmds.Add(out, struct_addr, shift))
-            return IndirectLValue(out)
+            base = IndirectLValue(out)
+
+        return self._wrap_bitfield(base, struct_ctype)
 
 
 class ObjPtrMember(_ObjLookup):
@@ -208,4 +239,4 @@ class ObjPtrMember(_ObjLookup):
 
         out = ILValue(PointerCType(ctype))
         il_code.add(math_cmds.Add(out, struct_addr, shift))
-        return IndirectLValue(out)
+        return self._wrap_bitfield(IndirectLValue(out), struct_addr.ctype.arg)

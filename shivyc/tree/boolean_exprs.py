@@ -6,6 +6,7 @@ import shivyc.il_cmds.value as value_cmds
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
+from shivyc.tree.utils import arith_conversion_type, set_type
 
 
 class _BoolAndOr(_RExprNode):
@@ -91,6 +92,17 @@ class BoolNot(_RExprNode):
             err = "'!' operator requires scalar operand"
             raise CompilerError(err, self.r)
 
+        # Constant-fold so `!` may appear in constant contexts such as array
+        # sizes and Py_BUILD_ASSERT_EXPR, e.g. `sizeof(char[1 - 2*!(cond)])`.
+        if expr.literal is not None:
+            out = ILValue(ctypes.integer)
+            try:
+                is_zero = float(expr.literal.val) == 0.0
+            except (TypeError, ValueError):
+                is_zero = not expr.literal.val
+            il_code.register_literal_var(out, "1" if is_zero else "0")
+            return out
+
         # ILValue for storing the output
         out = ILValue(ctypes.integer)
 
@@ -111,3 +123,107 @@ class BoolNot(_RExprNode):
         il_code.add(control_cmds.Label(end))
 
         return out
+
+
+class Conditional(_RExprNode):
+    """Conditional (ternary) operator: cond ? then : els."""
+
+    def __init__(self, cond, then, els, op):
+        """Initialize node."""
+        super().__init__()
+        self.cond = cond
+        self.then = then
+        self.els = els
+        self.op = op
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        cond = self.cond.make_il(il_code, symbol_table, c)
+        if not cond.ctype.is_scalar():
+            err = "conditional operator requires scalar first operand"
+            raise CompilerError(err, self.cond.r)
+
+        # If the condition is a compile-time constant, fold to the taken arm.
+        # This is what lets `?:` appear in constant contexts such as array
+        # sizes, e.g. `int x[sizeof(long) == 8 ? 14 : 9]`.
+        if cond.literal is not None:
+            taken = self.then if cond.literal.val != 0 else self.els
+            return taken.make_il(il_code, symbol_table, c)
+
+        then_store = il_code.get_label()
+        els_label = il_code.get_label()
+        end = il_code.get_label()
+
+        # If the condition is zero, run the else arm.
+        il_code.add(control_cmds.JumpZero(cond, els_label))
+
+        # The then arm is emitted first but, via the jump below, only executes
+        # when the condition is nonzero. Its store into `out` is deferred to
+        # `then_store` (after both arms are evaluated) so the common result
+        # type is known before either store is emitted.
+        then_val = self.then.make_il(il_code, symbol_table, c)
+        il_code.add(control_cmds.Jump(then_store))
+
+        il_code.add(control_cmds.Label(els_label))
+        els_val = self.els.make_il(il_code, symbol_table, c)
+
+        # Both arm types are now known; compute the result type.
+        out = ILValue(self._result_ctype(then_val, els_val))
+
+        # Else path: store (converted) else value, then skip the then store.
+        set_type(els_val, out.ctype, il_code, output=out)
+        il_code.add(control_cmds.Jump(end))
+
+        # Then path: store (converted) then value.
+        il_code.add(control_cmds.Label(then_store))
+        set_type(then_val, out.ctype, il_code, output=out)
+
+        il_code.add(control_cmds.Label(end))
+        return out
+
+    def _result_ctype(self, then_val, els_val):
+        """Determine the result type of the conditional operator."""
+        t, e = then_val.ctype, els_val.ctype
+        if t.is_arith() and e.is_arith():
+            return arith_conversion_type(t, e)
+
+        # A pointer paired with a null pointer constant yields the pointer
+        # type (e.g. `cond ? p : NULL`).
+        if t.is_pointer() and self._is_null_constant(els_val):
+            return t
+        if e.is_pointer() and self._is_null_constant(then_val):
+            return e
+
+        if t.is_pointer() and e.is_pointer():
+            # A `void *` operand with any object pointer yields `void *`.
+            if t.arg.is_void():
+                return t
+            if e.arg.is_void():
+                return e
+            # Pointers to compatible types (ignoring qualifiers) yield that
+            # pointer type.
+            if t.arg.make_unqual().compatible(e.arg.make_unqual()):
+                return t
+
+        # Two compatible structure/union operands yield that type. Qualifiers
+        # on the operands don't matter -- the result of `?:` is a non-lvalue,
+        # so its type is unqualified (C11 6.5.15). This covers e.g. a const
+        # global (CPython's `PyStackRef_NULL`) paired with a function result.
+        if t.is_struct_union() and e.is_struct_union():
+            if t.make_unqual().compatible(e.make_unqual()):
+                return t.make_unqual()
+
+        if t.compatible(e):
+            return t
+
+        err = "unsupported operand types for conditional operator"
+        raise CompilerError(err, self.r)
+
+    @staticmethod
+    def _is_null_constant(val):
+        """Whether an ILValue is a null pointer constant (0 or (void*)0)."""
+        lit = getattr(val, "literal", None)
+        if lit is None or getattr(lit, "val", None) != 0:
+            return False
+        return val.ctype.is_integral() or (
+            val.ctype.is_pointer() and val.ctype.arg.is_void())

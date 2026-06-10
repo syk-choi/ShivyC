@@ -2,6 +2,7 @@
 
 import shivyc.il_cmds.control as control_cmds
 from shivyc.errors import CompilerError
+from shivyc.il_gen import ILValue
 from shivyc.tree.base_nodes import Node
 from shivyc.tree.utils import report_err, set_type, check_cast
 
@@ -17,7 +18,17 @@ class Return(Node):
     def make_il(self, il_code, symbol_table, c):
         """Make IL code for returning this value."""
 
-        if self.return_value and not c.return_type.is_void():
+        if self.return_value and c.sret_ptr is not None:
+            # SysV memory-class return: copy the struct into the caller's
+            # storage via the hidden pointer, then return that pointer in RAX.
+            il_value = self.return_value.make_il(il_code, symbol_table, c)
+            check_cast(il_value, c.return_type, self.return_value.r)
+            ret = set_type(il_value, c.return_type, il_code)
+            from shivyc.tree.utils import IndirectLValue
+            IndirectLValue(c.sret_ptr).set_to(
+                ret, il_code, self.return_value.r)
+            il_code.add(control_cmds.Return(c.sret_ptr))
+        elif self.return_value and not c.return_type.is_void():
             il_value = self.return_value.make_il(il_code, symbol_table, c)
             check_cast(il_value, c.return_type, self.return_value.r)
             ret = set_type(il_value, c.return_type, il_code)
@@ -190,3 +201,178 @@ class ForStatement(Node):
         il_code.add(control_cmds.Label(end))
 
         symbol_table.end_scope()
+
+
+class DoWhileStatement(Node):
+    """Node for a do-while statement.
+
+    cond - Conditional expression checked after each iteration.
+    stat - Body of the loop, executed at least once.
+    """
+
+    def __init__(self, cond, stat):
+        """Initialize node."""
+        super().__init__()
+        self.cond = cond
+        self.stat = stat
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        start = il_code.get_label()
+        cont = il_code.get_label()
+        end = il_code.get_label()
+
+        il_code.add(control_cmds.Label(start))
+        # `continue` jumps to the condition test; `break` jumps past the loop.
+        c = c.set_continue(cont).set_break(end)
+
+        with report_err():
+            self.stat.make_il(il_code, symbol_table, c)
+
+        il_code.add(control_cmds.Label(cont))
+        with report_err():
+            cond = self.cond.make_il(il_code, symbol_table, c)
+            il_code.add(control_cmds.JumpZero(cond, end))
+
+        il_code.add(control_cmds.Jump(start))
+        il_code.add(control_cmds.Label(end))
+
+
+class _SwitchCollector:
+    """Collects case values/labels and the default label for a switch."""
+
+    def __init__(self):
+        self.cases = []      # list of (constant value, label)
+        self.default = None  # label or None
+
+
+class SwitchStatement(Node):
+    """Node for a switch statement.
+
+    cond - the controlling expression.
+    stat - the switch body.
+    """
+
+    def __init__(self, cond, stat):
+        """Initialize node."""
+        super().__init__()
+        self.cond = cond
+        self.stat = stat
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        import shivyc.il_cmds.math as math_cmds
+        val = self.cond.make_il(il_code, symbol_table, c)
+        if not val.ctype.is_integral():
+            err = "switch controlling expression must have integer type"
+            raise CompilerError(err, self.cond.r)
+
+        dispatch = il_code.get_label()
+        end = il_code.get_label()
+        collector = _SwitchCollector()
+
+        # Jump to the dispatch chain (emitted after the body), which compares
+        # the controlling value against each case and jumps back up to the
+        # matching case label. This lets case labels be discovered during the
+        # body's own emission (single pass) while keeping fall-through order.
+        il_code.add(control_cmds.Jump(dispatch))
+
+        body_c = c.set_break(end).set_switch(collector)
+        with report_err():
+            self.stat.make_il(il_code, symbol_table, body_c)
+        il_code.add(control_cmds.Jump(end))
+
+        il_code.add(control_cmds.Label(dispatch))
+        for case_val, label in collector.cases:
+            diff = ILValue(val.ctype)
+            cval = ILValue(val.ctype)
+            il_code.register_literal_var(cval, str(case_val))
+            il_code.add(math_cmds.Subtr(diff, val, cval))
+            il_code.add(control_cmds.JumpZero(diff, label))
+        if collector.default is not None:
+            il_code.add(control_cmds.Jump(collector.default))
+        il_code.add(control_cmds.Label(end))
+
+
+class CaseStatement(Node):
+    """Node for a `case CONST:` labeled statement."""
+
+    def __init__(self, expr, stat):
+        """Initialize node."""
+        super().__init__()
+        self.expr = expr
+        self.stat = stat
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        if c.switch is None:
+            err = "'case' label not within a switch statement"
+            raise CompilerError(err, self.r)
+        val = self.expr.make_il(il_code, symbol_table, c)
+        if not val.literal:
+            err = "case label must be a compile-time integer constant"
+            raise CompilerError(err, self.expr.r)
+        label = il_code.get_label()
+        c.switch.cases.append((val.literal.val, label))
+        il_code.add(control_cmds.Label(label))
+        self.stat.make_il(il_code, symbol_table, c)
+
+
+class DefaultStatement(Node):
+    """Node for a `default:` labeled statement."""
+
+    def __init__(self, stat):
+        """Initialize node."""
+        super().__init__()
+        self.stat = stat
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        if c.switch is None:
+            err = "'default' label not within a switch statement"
+            raise CompilerError(err, self.r)
+        label = il_code.get_label()
+        c.switch.default = label
+        il_code.add(control_cmds.Label(label))
+        self.stat.make_il(il_code, symbol_table, c)
+
+
+class LabelStatement(Node):
+    """Node for a labeled statement: `name: STMT`."""
+
+    def __init__(self, name, stat):
+        """Initialize node. `name` is the label identifier token."""
+        super().__init__()
+        self.name = name
+        self.stat = stat
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        if c.labels is None:
+            err = "label not within a function"
+            raise CompilerError(err, self.r)
+        key = self.name.content
+        if key not in c.labels:
+            c.labels[key] = il_code.get_label()
+        il_code.add(control_cmds.Label(c.labels[key]))
+        self.stat.make_il(il_code, symbol_table, c)
+
+
+class GotoStatement(Node):
+    """Node for a `goto name;` statement."""
+
+    def __init__(self, name):
+        """Initialize node. `name` is the target label identifier token."""
+        super().__init__()
+        self.name = name
+
+    def make_il(self, il_code, symbol_table, c):
+        """Make code for this node."""
+        if c.labels is None:
+            err = "goto not within a function"
+            raise CompilerError(err, self.r)
+        key = self.name.content
+        # Labels are forward-referenceable, so create the target on first use.
+        if key not in c.labels:
+            c.labels[key] = il_code.get_label()
+        il_code.add(control_cmds.Jump(c.labels[key]))

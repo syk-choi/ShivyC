@@ -23,6 +23,10 @@ class _Equality(_ArithBinOp):
         il_code.add(self.eq_il_cmd(out, left, right))
         return out
 
+    # Comparisons always yield int, even when constant-folded.
+    def _const_ctype(self, operand_ctype):
+        return ctypes.integer
+
     def _nonarith(self, left, right, il_code):
         """Check equality of non-arithmetic expressions."""
 
@@ -49,8 +53,10 @@ class _Equality(_ArithBinOp):
             check_cast(left, right.ctype, self.op.r)
             left = set_type(left, right.ctype, il_code)
 
-        # If both types are still incompatible, warn!
-        elif not left.ctype.compatible(right.ctype):
+        # If both types are still incompatible, warn! Qualifier differences on
+        # the pointed-to type (e.g. `char *` vs `const char *`) are allowed.
+        elif not left.ctype.arg.make_unqual().compatible(
+                right.ctype.arg.make_unqual()):
             with report_err():
                 err = "comparison between distinct pointer types"
                 raise CompilerError(err, self.op.r)
@@ -66,11 +72,17 @@ class Equality(_Equality):
 
     eq_il_cmd = compare_cmds.EqualCmp
 
+    def _arith_const(self, left, right, ctype):
+        return 1 if left == right else 0
+
 
 class Inequality(_Equality):
     """Expression that checks inequality of two expressions."""
 
     eq_il_cmd = compare_cmds.NotEqualCmp
+
+    def _arith_const(self, left, right, ctype):
+        return 1 if left != right else 0
 
 
 class _Relational(_ArithBinOp):
@@ -88,13 +100,18 @@ class _Relational(_ArithBinOp):
         il_code.add(self.comp_cmd(out, left, right))
         return out
 
+    # Comparisons always yield int, even when constant-folded.
+    def _const_ctype(self, operand_ctype):
+        return ctypes.integer
+
     def _nonarith(self, left, right, il_code):
         """Compare non-arithmetic expressions."""
 
         if not left.ctype.is_pointer() or not right.ctype.is_pointer():
             err = "comparison between incomparable types"
             raise CompilerError(err, self.op.r)
-        elif not left.ctype.compatible(right.ctype):
+        elif not left.ctype.arg.make_unqual().compatible(
+                right.ctype.arg.make_unqual()):
             err = "comparison between distinct pointer types"
             raise CompilerError(err, self.op.r)
 
@@ -107,17 +124,29 @@ class LessThan(_Relational):
     """Less than comparison expression."""
     comp_cmd = compare_cmds.LessCmp
 
+    def _arith_const(self, left, right, ctype):
+        return 1 if left < right else 0
+
 
 class GreaterThan(_Relational):
     """Greater than comparison expression."""
     comp_cmd = compare_cmds.GreaterCmp
+
+    def _arith_const(self, left, right, ctype):
+        return 1 if left > right else 0
 
 
 class LessThanOrEq(_Relational):
     """Less than or equal comparison expression."""
     comp_cmd = compare_cmds.LessOrEqCmp
 
+    def _arith_const(self, left, right, ctype):
+        return 1 if left <= right else 0
+
 
 class GreaterThanOrEq(_Relational):
     """Greater than or equal comparison expression."""
     comp_cmd = compare_cmds.GreaterOrEqCmp
+
+    def _arith_const(self, left, right, ctype):
+        return 1 if left >= right else 0

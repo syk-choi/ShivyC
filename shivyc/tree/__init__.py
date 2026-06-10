@@ -10,7 +10,9 @@ from shivyc.tree.base_nodes import Node
 
 # Control flow statements
 from shivyc.tree.control_flow_nodes import (
-    Return, Break, Continue, IfStatement, WhileStatement, ForStatement
+    Return, Break, Continue, IfStatement, WhileStatement, ForStatement,
+    DoWhileStatement, SwitchStatement, CaseStatement, DefaultStatement,
+    LabelStatement, GotoStatement
 )
 
 # General statement and declaration nodes
@@ -25,7 +27,7 @@ from shivyc.tree.primary_exprs import (
 
 # Arithmetic operations
 from shivyc.tree.arithmetic_exprs import (
-    Plus, Minus, Mult, Div, Mod, RBitShift, LBitShift
+    Plus, Minus, Mult, Div, Mod, RBitShift, LBitShift, BitAnd, BitOr, BitXor
 )
 
 # Comparison operations
@@ -36,12 +38,13 @@ from shivyc.tree.comparison_exprs import (
 
 # Boolean operations
 from shivyc.tree.boolean_exprs import (
-    BoolAnd, BoolOr, BoolNot
+    BoolAnd, BoolOr, BoolNot, Conditional
 )
 
 # Assignment operations
 from shivyc.tree.assignment_exprs import (
-    Equals, PlusEquals, MinusEquals, StarEquals, DivEquals, ModEquals
+    Equals, PlusEquals, MinusEquals, StarEquals, DivEquals, ModEquals,
+    OrEquals, AndEquals, XorEquals, LShiftEquals, RShiftEquals
 )
 
 # Unary operations
@@ -56,12 +59,13 @@ from shivyc.tree.memory_exprs import (
 
 # Type operations
 from shivyc.tree.type_exprs import (
-    SizeofExpr, SizeofType, Cast
+    SizeofExpr, SizeofType, AlignofType, AlignofExpr, OffsetofType, Cast,
+    CompoundLiteral
 )
 
 # Function calls
 from shivyc.tree.call_exprs import (
-    FuncCall
+    FuncCall, VaStartAddr, VaArg
 )
 
 # Expose all public classes in __all__
@@ -71,7 +75,9 @@ __all__ = [
 
     # Control flow statements
     'Return', 'Break', 'Continue',
-    'IfStatement', 'WhileStatement', 'ForStatement',
+    'IfStatement', 'WhileStatement', 'ForStatement', 'DoWhileStatement',
+    'SwitchStatement', 'CaseStatement', 'DefaultStatement',
+    'LabelStatement', 'GotoStatement',
 
     # General statement and declaration nodes
     'Root', 'Compound', 'EmptyStatement', 'ExprStatement', 'Declaration',
@@ -92,6 +98,7 @@ __all__ = [
 
     # Assignment operations
     'Equals', 'PlusEquals', 'MinusEquals', 'StarEquals', 'DivEquals',
+    'OrEquals', 'AndEquals', 'XorEquals', 'LShiftEquals', 'RShiftEquals',
     'ModEquals',
 
     # Unary operations
@@ -102,8 +109,9 @@ __all__ = [
     'AddrOf', 'Deref', 'ArraySubsc', 'ObjMember', 'ObjPtrMember',
 
     # Type operations
-    'SizeofExpr', 'SizeofType', 'Cast',
+    'SizeofExpr', 'SizeofType', 'AlignofType', 'AlignofExpr', 'OffsetofType',
+    'Cast', 'CompoundLiteral',
 
     # Function calls
-    'FuncCall'
+    'FuncCall', 'VaStartAddr', 'VaArg'
 ]

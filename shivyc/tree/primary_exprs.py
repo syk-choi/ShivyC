@@ -1,12 +1,14 @@
 """Primary expression nodes in the AST."""
 
 import shivyc.ctypes as ctypes
+import shivyc.lexer as lexer
 import shivyc.tree.general_nodes as general_nodes
 from shivyc.ctypes import ArrayCType
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
 from shivyc.tree.utils import DirectLValue
+from shivyc.tokens import parse_c_int
 
 
 class MultiExpr(_RExprNode):
@@ -39,13 +41,60 @@ class Number(_RExprNode):
         This function does not actually make any code in the IL, it just
         returns a LiteralILValue that can be used in IL code by the caller.
         """
-        v = int(str(self.number))
+        spelling = str(self.number)
+        if lexer.is_float_constant(spelling):
+            suffix = spelling[-1]
+            ctype = ctypes.flt if suffix in "fF" else ctypes.dbl
+            body = spelling.rstrip("fFlL")
+            try:
+                fval = (float.fromhex(body) if body[:2].lower() == "0x"
+                        else float(body))
+            except (OverflowError, ValueError):
+                # A constant outside the representable range of our floating
+                # types (e.g. an 80-bit long-double hex constant, since long
+                # double is aliased to double). Report cleanly instead of
+                # letting the exception escape as a crash.
+                err = "floating constant out of range"
+                raise CompilerError(err, self.number.r)
+            il_value = ILValue(ctype)
+            il_code.register_float_literal(il_value, fval)
+            return il_value
 
-        if ctypes.int_min <= v <= ctypes.int_max:
-            il_value = ILValue(ctypes.integer)
-        elif ctypes.long_min <= v <= ctypes.long_max:
-            il_value = ILValue(ctypes.longint)
-        else:
+        v = parse_c_int(spelling)
+
+        # Determine the literal's type per C rules. Extract the u/l suffix and
+        # whether the constant is decimal (vs hex/octal/binary): a decimal
+        # constant without a 'u' suffix only takes signed types, while a
+        # hex/octal constant or a 'u'-suffixed one may take unsigned types.
+        i = len(spelling)
+        while i > 0 and spelling[i - 1] in "uUlL":
+            i -= 1
+        suffix = spelling[i:].lower()
+        body = spelling[:i]
+        has_u = "u" in suffix
+        has_l = "l" in suffix
+        is_decimal = (body[:2].lower() not in ("0x", "0b")
+                      and not (len(body) > 1 and body[0] == "0"))
+
+        UINT_MAX = 4294967295
+        ULONG_MAX = 18446744073709551615
+        I = (ctypes.integer, ctypes.int_min, ctypes.int_max)
+        UI = (ctypes.unsig_int, 0, UINT_MAX)
+        L = (ctypes.longint, ctypes.long_min, ctypes.long_max)
+        UL = (ctypes.unsig_longint, 0, ULONG_MAX)
+        if has_u:
+            candidates = [UL] if has_l else [UI, UL]
+        elif is_decimal:
+            candidates = [L] if has_l else [I, L]
+        else:  # hex / octal / binary without 'u'
+            candidates = [L, UL] if has_l else [I, UI, L, UL]
+
+        il_value = None
+        for ctype, lo, hi in candidates:
+            if lo <= v <= hi:
+                il_value = ILValue(ctype)
+                break
+        if il_value is None:
             err = "integer literal too large to be represented by any " \
                   "integer type"
             raise CompilerError(err, self.number.r)
@@ -62,13 +111,18 @@ class String(_LExprNode):
 
     """
 
-    def __init__(self, chars):
-        """Initialize Node."""
+    def __init__(self, chars, wide=False):
+        """Initialize Node.
+
+        wide - True for an L"..." literal, whose elements are wchar_t (int).
+        """
         super().__init__()
         self.chars = chars
+        self.wide = wide
 
     def _lvalue(self, il_code, symbol_table, c):
-        il_value = ILValue(ArrayCType(ctypes.char, len(self.chars)))
+        el = ctypes.integer if getattr(self, "wide", False) else ctypes.char
+        il_value = ILValue(ArrayCType(el, len(self.chars)))
         il_code.register_string_literal(il_value, self.chars)
         return DirectLValue(il_value)
 
@@ -84,6 +138,21 @@ class Identifier(_LExprNode):
     def _lvalue(self, il_code, symbol_table, c):
         var = symbol_table.lookup_variable(self.identifier)
         return DirectLValue(var)
+
+    def make_il(self, il_code, symbol_table, c):
+        """Resolve an enum constant to an integer literal, else load lvalue."""
+        enum_val = symbol_table.lookup_enum_const(self.identifier.content)
+        if enum_val is not None:
+            out = ILValue(ctypes.integer)
+            il_code.register_literal_var(out, str(enum_val))
+            return out
+        return super().make_il(il_code, symbol_table, c)
+
+    def make_il_raw(self, il_code, symbol_table, c):
+        """Same as make_il for enum constants (no lvalue to decay)."""
+        if symbol_table.lookup_enum_const(self.identifier.content) is not None:
+            return self.make_il(il_code, symbol_table, c)
+        return super().make_il_raw(il_code, symbol_table, c)
 
 
 class ParenExpr(general_nodes.Node):

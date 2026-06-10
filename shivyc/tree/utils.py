@@ -276,8 +276,25 @@ def check_cast(il_value, ctype, range):
               and (not il_value.ctype.arg.const or ctype.arg.const)):
             return
 
+        # GCC extension (relied on by CPython and musl): a void pointer
+        # converts to/from a function pointer. Strict C keeps object and
+        # function pointers separate, but real-world C mixes them freely
+        # (e.g. comparing a `void *` slot against a PyCFunction).
+        elif (ctype.arg.is_void() and il_value.ctype.arg.is_function()
+              and (not il_value.ctype.arg.const or ctype.arg.const)):
+            return
+
+        elif (ctype.arg.is_function() and il_value.ctype.arg.is_void()
+              and (not il_value.ctype.arg.const or ctype.arg.const)):
+            return
+
         # error on any other kind of pointer cast - TODO: better errors
         else:
+            # A null pointer constant (e.g. NULL == (void*)0) converts to any
+            # pointer type, including a function pointer, even though void*
+            # and a function pointer are otherwise incompatible.
+            if getattr(il_value.literal, "val", None) == 0:
+                return
             with report_err():
                 err = "conversion from incompatible pointer type"
                 raise CompilerError(err, range)
@@ -316,11 +333,17 @@ def set_type(il_value, ctype, il_code, output=None):
         return il_value
     elif not output and il_value.literal:
         output = ILValue(ctype)
-        if ctype.is_integral():
-            val = shift_into_range(il_value.literal.val, ctype)
+        if ctype.is_floating():
+            # int or float constant -> float: fold to a float literal.
+            il_code.register_float_literal(output, float(il_value.literal.val))
+        elif ctype.is_integral():
+            src = il_value.literal.val
+            if il_value.ctype.is_floating():
+                src = int(src)   # C float->int conversion truncates toward 0
+            val = shift_into_range(src, ctype)
+            il_code.register_literal_var(output, val)
         else:
-            val = il_value.literal.val
-        il_code.register_literal_var(output, val)
+            il_code.register_literal_var(output, il_value.literal.val)
         return output
     else:
         if not output:
@@ -341,6 +364,13 @@ def arith_conversion_type(type1, type2):
     # If an int can represent all values of the original type, the value is
     # converted to an int; otherwise, it is converted to an unsigned
     # int. These are called the integer promotions.
+
+    # If either operand is floating, the result is the wider floating type
+    # (double dominates float, and a float operand dominates any integer).
+    if type1.is_floating() or type2.is_floating():
+        if type1.is_floating() and type2.is_floating():
+            return type1 if type1.size >= type2.size else type2
+        return type1 if type1.is_floating() else type2
 
     # All types of size < 4 can fit in int, so we promote directly to int
     type1_promo = ctypes.integer if type1.size < 4 else type1
@@ -425,3 +455,66 @@ def shift_into_range(val, ctype):
         val -= range
 
     return val
+
+
+class BitFieldLValue(LValue):
+    """LValue for a bitfield struct/union member.
+
+    ShivyC lays out each bitfield in its own storage unit of the declared
+    type, so this wraps the LValue of that unit and masks reads and writes to
+    the field's declared bit width. Unsigned fields zero-extend on read;
+    signed fields sign-extend. The exact bit packing differs from GCC, but the
+    observable values are correct (which matches ShivyC's non-ABI struct
+    layout generally).
+    """
+
+    def __init__(self, base, width, signed):
+        """Initialize from the storage-unit LValue, bit width, and signedness.
+        """
+        self.base = base
+        self.width = width
+        self.signed = signed
+
+    def ctype(self):  # noqa D102
+        return self.base.ctype()
+
+    def addr(self, il_code):  # noqa D102
+        raise CompilerError("cannot take the address of a bit-field")
+
+    def val(self, il_code):  # noqa D102
+        ctype = self.base.ctype()
+        v = self.base.val(il_code)
+        bits = ctype.size * 8
+        if self.width >= bits:
+            return v
+
+        if self.signed:
+            # Sign-extend: (v << (bits - width)) >> (bits - width), where the
+            # right shift is arithmetic (RBitShift emits `sar`).
+            sh = ILValue(ctype)
+            il_code.register_literal_var(sh, bits - self.width)
+            tmp = ILValue(ctype)
+            il_code.add(math_cmds.LBitShift(tmp, v, sh))
+            out = ILValue(ctype)
+            il_code.add(math_cmds.RBitShift(out, tmp, sh))
+            return out
+
+        mask = ILValue(ctype)
+        il_code.register_literal_var(mask, (1 << self.width) - 1)
+        out = ILValue(ctype)
+        il_code.add(math_cmds.BitAnd(out, v, mask))
+        return out
+
+    def set_to(self, rvalue, il_code, r):  # noqa D102
+        ctype = self.base.ctype()
+        bits = ctype.size * 8
+        rconv = set_type(rvalue, ctype, il_code)
+        if self.width < bits:
+            mask = ILValue(ctype)
+            il_code.register_literal_var(mask, (1 << self.width) - 1)
+            masked = ILValue(ctype)
+            il_code.add(math_cmds.BitAnd(masked, rconv, mask))
+        else:
+            masked = rconv
+        self.base.set_to(masked, il_code, r)
+        return self.val(il_code)

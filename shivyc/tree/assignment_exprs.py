@@ -22,6 +22,20 @@ class Equals(_RExprNode):
         right = self.right.make_il(il_code, symbol_table, c)
         lvalue = self.left.lvalue(il_code, symbol_table, c)
 
+        # Keep contract length-tracking accurate across reassignments.
+        import shivyc.tree.primary_exprs as _pe
+        if isinstance(self.left, _pe.Identifier):
+            import shivyc.contracts as _contracts
+            try:
+                var = symbol_table.lookup_variable(self.left.identifier)
+            except CompilerError:
+                var = None
+            if isinstance(self.right, _pe.String):
+                _contracts.set_known_len(
+                    var, max(0, len(self.right.chars) - 1))
+            else:
+                _contracts.clear_known_len(var)
+
         if lvalue and lvalue.modable():
             return lvalue.set_to(right, il_code, self.op.r)
         else:
@@ -122,4 +136,39 @@ class ModEquals(_CompoundPlusMinus):
     """Expression that is %=."""
 
     command = math_cmds.Mod
+    accept_pointer = False
+
+
+class OrEquals(_CompoundPlusMinus):
+    """Expression that is |=."""
+
+    command = math_cmds.BitOr
+    accept_pointer = False
+
+
+class AndEquals(_CompoundPlusMinus):
+    """Expression that is &=."""
+
+    command = math_cmds.BitAnd
+    accept_pointer = False
+
+
+class XorEquals(_CompoundPlusMinus):
+    """Expression that is ^=."""
+
+    command = math_cmds.BitXor
+    accept_pointer = False
+
+
+class LShiftEquals(_CompoundPlusMinus):
+    """Expression that is <<=."""
+
+    command = math_cmds.LBitShift
+    accept_pointer = False
+
+
+class RShiftEquals(_CompoundPlusMinus):
+    """Expression that is >>=."""
+
+    command = math_cmds.RBitShift
     accept_pointer = False

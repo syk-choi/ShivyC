@@ -33,18 +33,32 @@ class _ArithBinOp(_RExprNode):
             left, right = arith_convert(left, right, il_code)
 
             if left.literal and right.literal:
-                # If NotImplementedError is raised, continue with execution.
-                try:
-                    val = self._arith_const(
-                        shift_into_range(left.literal.val, left.ctype),
-                        shift_into_range(right.literal.val, right.ctype),
-                        left.ctype)
-                    out = ILValue(left.ctype)
-                    il_code.register_literal_var(out, val)
-                    return out
+                if left.ctype.is_floating():
+                    # Fold floating constant arithmetic. Python floats are
+                    # IEEE-754 doubles, so +,-,*,/ on double constants match
+                    # the SSE result exactly; the result is re-rounded to the
+                    # target type when emitted. Operators that do not apply to
+                    # floats (and comparisons) return None and fall through to
+                    # the runtime path.
+                    fval = self._float_const(left.literal.val,
+                                             right.literal.val)
+                    if fval is not None:
+                        out = ILValue(self._const_ctype(left.ctype))
+                        il_code.register_float_literal(out, float(fval))
+                        return out
+                else:
+                    # If NotImplementedError is raised, continue execution.
+                    try:
+                        val = self._arith_const(
+                            shift_into_range(left.literal.val, left.ctype),
+                            shift_into_range(right.literal.val, right.ctype),
+                            left.ctype)
+                        out = ILValue(self._const_ctype(left.ctype))
+                        il_code.register_literal_var(out, val)
+                        return out
 
-                except NotImplementedError:
-                    pass
+                    except NotImplementedError:
+                        pass
 
             return self._arith(left, right, il_code)
 
@@ -98,6 +112,20 @@ class _ArithBinOp(_RExprNode):
         """
         raise NotImplementedError
 
+    def _float_const(self, left, right):
+        """Return the result on constant floating operands, or None if this
+        operator does not fold floats (the default; e.g. comparisons)."""
+        return None
+
+    def _const_ctype(self, operand_ctype):
+        """Return the ctype of a constant-folded result.
+
+        Defaults to the (already converted) operand type, which is correct for
+        arithmetic operators. Operators whose result type differs from their
+        operands -- the comparisons, which always yield `int` -- override this.
+        """
+        return operand_ctype
+
     def _nonarith(self, left, right, il_code):
         """Return the result of this operation on given nonarithmetic operands.
 
@@ -123,6 +151,9 @@ class Plus(_ArithBinOp):
 
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left + right, ctype)
+
+    def _float_const(self, left, right):
+        return left + right
 
     def _nonarith(self, left, right, il_code):
         """Make addition code if either operand is non-arithmetic type."""
@@ -165,12 +196,17 @@ class Minus(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left - right, ctype)
 
+    def _float_const(self, left, right):
+        return left - right
+
     def _nonarith(self, left, right, il_code):
         """Make subtraction code if both operands are non-arithmetic type."""
 
-        # TODO: this isn't quite right when we allow qualifiers
+        # Pointer difference: the pointed-to types must be compatible ignoring
+        # qualifiers, so `char *` - `const char *` is valid (C11 6.5.6p3).
         if (left.ctype.is_pointer() and right.ctype.is_pointer()
-             and left.ctype.compatible(right.ctype)):
+                and left.ctype.arg.make_unqual().compatible(
+                    right.ctype.arg.make_unqual())):
 
             if (not left.ctype.arg.is_complete()
                   or not right.ctype.arg.is_complete()):
@@ -218,6 +254,9 @@ class Mult(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left * right, ctype)
 
+    def _float_const(self, left, right):
+        return left * right
+
     def _nonarith(self, left, right, il_code):
         err = "invalid operand types for multiplication"
         raise CompilerError(err, self.op.r)
@@ -247,6 +286,9 @@ class Div(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(int(left / right), ctype)
 
+    def _float_const(self, left, right):
+        return left / right if right != 0 else None
+
     def _nonarith(self, left, right, il_code):
         err = "invalid operand types for division"
         raise CompilerError(err, self.op.r)
@@ -260,6 +302,17 @@ class Mod(_IntBinOp):
         super().__init__(left, right, op)
 
     default_il_cmd = math_cmds.Mod
+
+    def _arith_const(self, left, right, ctype):
+        # C99 % truncates toward zero (unlike Python's floor modulo), so the
+        # remainder takes the sign of the dividend. Compute it with exact
+        # integer math. Division by zero is undefined; leave it to runtime.
+        if right == 0:
+            raise NotImplementedError
+        q = abs(left) // abs(right)
+        if (left < 0) != (right < 0):
+            q = -q
+        return shift_into_range(left - q * right, ctype)
 
     def _nonarith(self, left, right, il_code):
         err = "invalid operand types for modulus"
@@ -285,8 +338,41 @@ class RBitShift(_BitShift):
 
     default_il_cmd = math_cmds.RBitShift
 
+    def _arith_const(self, left, right, ctype):
+        return shift_into_range(left >> right, ctype)
+
 
 class LBitShift(_BitShift):
     """Represent a `<<` operator."""
 
     default_il_cmd = math_cmds.LBitShift
+
+    def _arith_const(self, left, right, ctype):
+        return shift_into_range(left << right, ctype)
+
+
+class BitAnd(_ArithBinOp):
+    """Expression for bitwise AND (&) of two integers."""
+
+    default_il_cmd = math_cmds.BitAnd
+
+    def _arith_const(self, left, right, ctype):
+        return shift_into_range(left & right, ctype)
+
+
+class BitOr(_ArithBinOp):
+    """Expression for bitwise OR (|) of two integers."""
+
+    default_il_cmd = math_cmds.BitOr
+
+    def _arith_const(self, left, right, ctype):
+        return shift_into_range(left | right, ctype)
+
+
+class BitXor(_ArithBinOp):
+    """Expression for bitwise XOR (^) of two integers."""
+
+    default_il_cmd = math_cmds.BitXor
+
+    def _arith_const(self, left, right, ctype):
+        return shift_into_range(left ^ right, ctype)

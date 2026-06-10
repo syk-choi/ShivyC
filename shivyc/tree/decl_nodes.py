@@ -45,7 +45,8 @@ class Root(DeclNode):
     decls (List(Node)) - list of declarator nodes
     """
 
-    def __init__(self, specs, decls, inits=None):
+    def __init__(self, specs, decls, inits=None, bitfields=None,
+                 asm_regs=None):
         """Generate root node."""
         self.specs = specs
         self.decls = decls
@@ -54,6 +55,21 @@ class Root(DeclNode):
             self.inits = inits
         else:
             self.inits = [None] * len(self.decls)
+
+        # Parallel to `decls`: the bitfield width expression for each
+        # declarator, or None if that declarator is not a bitfield. Only set
+        # for struct/union members.
+        if bitfields:
+            self.bitfields = bitfields
+        else:
+            self.bitfields = [None] * len(self.decls)
+
+        # Parallel to `decls`: a GCC `__asm__("reg")` register binding for
+        # each declarator (e.g. `register long r10 __asm__("r10")`), or None.
+        if asm_regs:
+            self.asm_regs = asm_regs
+        else:
+            self.asm_regs = [None] * len(self.decls)
 
         super().__init__()
 
@@ -91,10 +107,11 @@ class Function(DeclNode):
     args (List(Node)) - arguments of the functions
     """
 
-    def __init__(self, args, child):
+    def __init__(self, args, child, variadic=False):
         """Generate array node."""
         self.args = args
         self.child = child
+        self.variadic = variadic
         super().__init__()
 
 
@@ -145,3 +162,35 @@ class Union(_StructUnion):
     def __init__(self, tag, members, r):
         self.kind = token_kinds.union_kw
         super().__init__(tag, members, r)
+
+
+class InitList:
+    """A brace-enclosed initializer, e.g. {1, 2, .x = 3, [4] = 5, {..}}.
+
+    items - list of (designators, init) tuples, where:
+      * designators is a list of ('member', name_token) / ('index', expr_node)
+        entries (empty for a positional element), and
+      * init is either an expression node or a nested InitList.
+    """
+
+    def __init__(self, items, r=None):
+        self.items = items
+        self.r = r
+
+
+class Enum(DeclNode):
+    """Represents an enum C type.
+
+    tag (Token or None) - the enum tag, if any.
+    enumerators (List((Token, Node or None)) or None) - the (name, value)
+        pairs; None means this is just a reference like `enum E`.
+    r (Range) - range that the specifier covers.
+    """
+
+    def __init__(self, tag, enumerators, r):
+        self.tag = tag
+        self.enumerators = enumerators
+        # `kind` lets make_specs_ctype treat this like a type-specifier token.
+        self.kind = token_kinds.enum_kw
+        self.r = r
+        super().__init__()

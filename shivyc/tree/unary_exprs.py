@@ -31,7 +31,12 @@ class _IncrDecr(_RExprNode):
 
         val = self.expr.make_il(il_code, symbol_table, c)
         one = ILValue(val.ctype)
-        if val.ctype.is_arith():
+        if val.ctype.is_floating():
+            # A floating increment/decrement step must be a float constant so
+            # it is materialized in memory; an integer literal would reach the
+            # SSE add/sub as an (illegal) immediate operand.
+            il_code.register_float_literal(one, 1.0)
+        elif val.ctype.is_arith():
             il_code.register_literal_var(one, 1)
         elif val.ctype.is_pointer() and val.ctype.arg.is_complete():
             il_code.register_literal_var(one, val.ctype.arg.size)
@@ -116,8 +121,11 @@ class _ArithUnOp(_RExprNode):
             # perform constant folding
             if expr.literal:
                 val = self._arith_const(expr.literal.val, expr.ctype)
-                val = shift_into_range(val, expr.ctype)
-                il_code.register_literal_var(out, val)
+                if expr.ctype.is_floating():
+                    il_code.register_float_literal(out, float(val))
+                else:
+                    val = shift_into_range(val, expr.ctype)
+                    il_code.register_literal_var(out, val)
             else:
                 il_code.add(self.cmd(out, expr))
             return out
@@ -150,6 +158,8 @@ class UnaryMinus(_ArithUnOp):
     cmd = math_cmds.Neg
 
     def _arith_const(self, expr, ctype):
+        if ctype.is_floating():
+            return -expr
         return -shift_into_range(expr, ctype)
 
 
