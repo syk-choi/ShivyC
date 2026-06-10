@@ -16133,9 +16133,313 @@ SECTIONS
 }
 '''
 
+# src/kernel/idt64.S
+BM64_IDT64_S = r'''/* idt64.S - 64-bit (long mode) interrupt stub table for ShivyCX/minikraft.
+ *
+ * Provides isr0..isr31 (CPU exceptions) and irq0..irq15 (PIC, remapped to
+ * vectors 32..47), plus the common stubs that save the full 64-bit register
+ * frame, call the C dispatchers, and return with iretq.
+ *
+ * Frame layout pushed here must match `struct interrupt_frame64` in idt64.c.
+ */
+
+.code64
+.section .text
+
+/* ----- per-vector stubs ------------------------------------------------- */
+.macro ISR_NOERR num
+.global isr\num
+isr\num:
+    cli
+    pushq $0            /* dummy error code */
+    pushq $\num         /* interrupt number */
+    jmp isr_common_stub
+.endm
+
+.macro ISR_ERR num
+.global isr\num
+isr\num:
+    cli
+    pushq $\num         /* error code already pushed by CPU */
+    jmp isr_common_stub
+.endm
+
+.macro IRQ num, vec
+.global irq\num
+irq\num:
+    cli
+    pushq $0
+    pushq $\vec
+    jmp irq_common_stub
+.endm
+
+ISR_NOERR 0
+ISR_NOERR 1
+ISR_NOERR 2
+ISR_NOERR 3
+ISR_NOERR 4
+ISR_NOERR 5
+ISR_NOERR 6
+ISR_NOERR 7
+ISR_ERR   8
+ISR_NOERR 9
+ISR_ERR   10
+ISR_ERR   11
+ISR_ERR   12
+ISR_ERR   13
+ISR_ERR   14
+ISR_NOERR 15
+ISR_NOERR 16
+ISR_ERR   17
+ISR_NOERR 18
+ISR_NOERR 19
+ISR_NOERR 20
+ISR_NOERR 21
+ISR_NOERR 22
+ISR_NOERR 23
+ISR_NOERR 24
+ISR_NOERR 25
+ISR_NOERR 26
+ISR_NOERR 27
+ISR_NOERR 28
+ISR_NOERR 29
+ISR_ERR   30
+ISR_NOERR 31
+
+IRQ 0, 32
+IRQ 1, 33
+IRQ 2, 34
+IRQ 3, 35
+IRQ 4, 36
+IRQ 5, 37
+IRQ 6, 38
+IRQ 7, 39
+IRQ 8, 40
+IRQ 9, 41
+IRQ 10, 42
+IRQ 11, 43
+IRQ 12, 44
+IRQ 13, 45
+IRQ 14, 46
+IRQ 15, 47
+
+/* ----- save/restore + dispatch ----------------------------------------- */
+/* Push order defines the in-memory frame (rax ends up at the lowest address,
+ * matching interrupt_frame64's first field). */
+.macro SAVE_REGS
+    pushq %r15
+    pushq %r14
+    pushq %r13
+    pushq %r12
+    pushq %r11
+    pushq %r10
+    pushq %r9
+    pushq %r8
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
+    pushq %rax
+.endm
+
+.macro RESTORE_REGS
+    popq %rax
+    popq %rbx
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rbp
+    popq %r8
+    popq %r9
+    popq %r10
+    popq %r11
+    popq %r12
+    popq %r13
+    popq %r14
+    popq %r15
+.endm
+
+.extern isr_handler
+.extern irq_handler
+
+.global isr_common_stub
+isr_common_stub:
+    SAVE_REGS
+    movq %rsp, %rdi         /* arg0 = &interrupt_frame64 */
+    movq %rsp, %rbx         /* remember frame base */
+    andq $-16, %rsp         /* 16-byte align for the SysV call */
+    call isr_handler
+    movq %rbx, %rsp         /* restore frame base */
+    RESTORE_REGS
+    addq $16, %rsp          /* drop int_no + err_code */
+    iretq
+
+.global irq_common_stub
+irq_common_stub:
+    SAVE_REGS
+    movq %rsp, %rdi
+    movq %rsp, %rbx
+    andq $-16, %rsp
+    call irq_handler
+    movq %rbx, %rsp
+    RESTORE_REGS
+    addq $16, %rsp
+    iretq
+'''
+
+# src/kernel/idt64.c
+BM64_IDT64_C = r'''/* idt64.c - 64-bit (long mode) IDT for ShivyCX/minikraft.
+ *
+ * Drop-in replacement for the 32-bit idt.c: exposes the same public symbols
+ * (idt_init, register_interrupt_handler, isr_handler, irq_handler) so
+ * kernel.c / interrupts.c / thread.c link against it unchanged, but uses
+ * 16-byte long-mode gate descriptors and a 64-bit register frame.
+ */
+
+#include <stdint.h>
+#include "string.h"
+#include "console.h"
+
+#define IDT_ENTRIES 256
+#define KERNEL_CS   0x08      /* 64-bit code selector from boot64.S GDT */
+#define GATE_INTR   0x8E      /* present, DPL0, 64-bit interrupt gate */
+
+typedef void (*interrupt_handler_t)(void);
+
+/* 16-byte long-mode gate descriptor. */
+struct idt64_entry {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t  ist;
+    uint8_t  type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t zero;
+} __attribute__((packed));
+
+struct idt64_ptr {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+/* 64-bit register frame; field order must match the pushes in idt64.S. */
+struct interrupt_frame64 {
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t int_no, err_code;
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+
+static struct idt64_entry idt[IDT_ENTRIES];
+static struct idt64_ptr   idtp;
+static interrupt_handler_t interrupt_handlers[IDT_ENTRIES];
+
+/* Stub table from idt64.S */
+extern void isr0(void);  extern void isr1(void);  extern void isr2(void);
+extern void isr3(void);  extern void isr4(void);  extern void isr5(void);
+extern void isr6(void);  extern void isr7(void);  extern void isr8(void);
+extern void isr9(void);  extern void isr10(void); extern void isr11(void);
+extern void isr12(void); extern void isr13(void); extern void isr14(void);
+extern void isr15(void); extern void isr16(void); extern void isr17(void);
+extern void isr18(void); extern void isr19(void); extern void isr20(void);
+extern void isr21(void); extern void isr22(void); extern void isr23(void);
+extern void isr24(void); extern void isr25(void); extern void isr26(void);
+extern void isr27(void); extern void isr28(void); extern void isr29(void);
+extern void isr30(void); extern void isr31(void);
+extern void irq0(void);  extern void irq1(void);  extern void irq2(void);
+extern void irq3(void);  extern void irq4(void);  extern void irq5(void);
+extern void irq6(void);  extern void irq7(void);  extern void irq8(void);
+extern void irq9(void);  extern void irq10(void); extern void irq11(void);
+extern void irq12(void); extern void irq13(void); extern void irq14(void);
+extern void irq15(void);
+
+static void set_gate(uint8_t num, uint64_t handler) {
+    idt[num].offset_low  = (uint16_t)(handler & 0xFFFF);
+    idt[num].selector    = KERNEL_CS;
+    idt[num].ist         = 0;
+    idt[num].type_attr   = GATE_INTR;
+    idt[num].offset_mid  = (uint16_t)((handler >> 16) & 0xFFFF);
+    idt[num].offset_high = (uint32_t)((handler >> 32) & 0xFFFFFFFF);
+    idt[num].zero        = 0;
+}
+
+/* Compatibility shim matching the 32-bit idt.h prototype. */
+void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
+    (void)sel; (void)flags;
+    set_gate(num, (uint64_t)base);
+}
+
+void register_interrupt_handler(uint8_t interrupt, interrupt_handler_t handler) {
+    interrupt_handlers[interrupt] = handler;
+}
+
+/* C dispatcher for CPU exceptions (vectors 0-31). */
+void isr_handler(struct interrupt_frame64 *frame) {
+    if (interrupt_handlers[frame->int_no]) {
+        interrupt_handlers[frame->int_no]();
+    }
+}
+
+/* C dispatcher for hardware IRQs (vectors 32-47), sends PIC EOI. */
+void irq_handler(struct interrupt_frame64 *frame) {
+    uint8_t irq = (uint8_t)(frame->int_no - 32);
+
+    if (interrupt_handlers[frame->int_no]) {
+        interrupt_handlers[frame->int_no]();
+    }
+
+    /* End Of Interrupt: slave first (if applicable), then master. */
+    if (irq >= 8) {
+        __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x20), "Nd"((uint16_t)0xA0));
+    }
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x20), "Nd"((uint16_t)0x20));
+}
+
+void idt_init(void) {
+    idtp.limit = (uint16_t)(sizeof(idt) - 1);
+    idtp.base  = (uint64_t)(uintptr_t)&idt;
+
+    memset(&idt, 0, sizeof(idt));
+    memset(interrupt_handlers, 0, sizeof(interrupt_handlers));
+
+    set_gate(0,(uint64_t)(uintptr_t)isr0);   set_gate(1,(uint64_t)(uintptr_t)isr1);
+    set_gate(2,(uint64_t)(uintptr_t)isr2);   set_gate(3,(uint64_t)(uintptr_t)isr3);
+    set_gate(4,(uint64_t)(uintptr_t)isr4);   set_gate(5,(uint64_t)(uintptr_t)isr5);
+    set_gate(6,(uint64_t)(uintptr_t)isr6);   set_gate(7,(uint64_t)(uintptr_t)isr7);
+    set_gate(8,(uint64_t)(uintptr_t)isr8);   set_gate(9,(uint64_t)(uintptr_t)isr9);
+    set_gate(10,(uint64_t)(uintptr_t)isr10); set_gate(11,(uint64_t)(uintptr_t)isr11);
+    set_gate(12,(uint64_t)(uintptr_t)isr12); set_gate(13,(uint64_t)(uintptr_t)isr13);
+    set_gate(14,(uint64_t)(uintptr_t)isr14); set_gate(15,(uint64_t)(uintptr_t)isr15);
+    set_gate(16,(uint64_t)(uintptr_t)isr16); set_gate(17,(uint64_t)(uintptr_t)isr17);
+    set_gate(18,(uint64_t)(uintptr_t)isr18); set_gate(19,(uint64_t)(uintptr_t)isr19);
+    set_gate(20,(uint64_t)(uintptr_t)isr20); set_gate(21,(uint64_t)(uintptr_t)isr21);
+    set_gate(22,(uint64_t)(uintptr_t)isr22); set_gate(23,(uint64_t)(uintptr_t)isr23);
+    set_gate(24,(uint64_t)(uintptr_t)isr24); set_gate(25,(uint64_t)(uintptr_t)isr25);
+    set_gate(26,(uint64_t)(uintptr_t)isr26); set_gate(27,(uint64_t)(uintptr_t)isr27);
+    set_gate(28,(uint64_t)(uintptr_t)isr28); set_gate(29,(uint64_t)(uintptr_t)isr29);
+    set_gate(30,(uint64_t)(uintptr_t)isr30); set_gate(31,(uint64_t)(uintptr_t)isr31);
+
+    set_gate(32,(uint64_t)(uintptr_t)irq0);  set_gate(33,(uint64_t)(uintptr_t)irq1);
+    set_gate(34,(uint64_t)(uintptr_t)irq2);  set_gate(35,(uint64_t)(uintptr_t)irq3);
+    set_gate(36,(uint64_t)(uintptr_t)irq4);  set_gate(37,(uint64_t)(uintptr_t)irq5);
+    set_gate(38,(uint64_t)(uintptr_t)irq6);  set_gate(39,(uint64_t)(uintptr_t)irq7);
+    set_gate(40,(uint64_t)(uintptr_t)irq8);  set_gate(41,(uint64_t)(uintptr_t)irq9);
+    set_gate(42,(uint64_t)(uintptr_t)irq10); set_gate(43,(uint64_t)(uintptr_t)irq11);
+    set_gate(44,(uint64_t)(uintptr_t)irq12); set_gate(45,(uint64_t)(uintptr_t)irq13);
+    set_gate(46,(uint64_t)(uintptr_t)irq14); set_gate(47,(uint64_t)(uintptr_t)irq15);
+
+    __asm__ volatile("lidt %0" : : "m"(idtp));
+}
+'''
+
 MINIKRAFT_BAREMETAL64 = {
     'src/boot/boot64.S': BM64_BOOT64_S,
     'src/kernel/kernel64.ld': BM64_KERNEL64_LD,
+    'src/kernel/idt64.S': BM64_IDT64_S,
+    'src/kernel/idt64.c': BM64_IDT64_C,
 }
 
 

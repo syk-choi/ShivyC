@@ -223,6 +223,42 @@ class BareMetalLinker:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
     # -- bootable image (boot64.S + kernel64.ld) ------------------------
+    def _install_idt64_overrides(self):
+        """Swap the 32-bit idt.c out of the symbol pool and swap in the 64-bit
+        long-mode IDT (idt64.c + idt64.S) embedded in minikraft.py. This is
+        what unlocks kernel_main / keyboard / timer at 64-bit."""
+        if getattr(self, "_idt64_installed", False):
+            return
+        gcc = _tool("gcc")
+        nm = _tool("nm")
+        files = mk.write_baremetal64(self.srcroot)
+        incdir = os.path.join(self.srcroot, mk.INCLUDE_DIR)
+        kdir = os.path.join(self.srcroot, "src", "kernel")
+
+        # Drop every symbol the 32-bit idt.c used to provide.
+        for sym, rel in list(self._provider.items()):
+            if os.path.basename(rel) == "idt.c":
+                del self._provider[sym]
+        self._obj.pop("src/kernel/idt.c", None)
+        self._undef.pop("src/kernel/idt.c", None)
+
+        # Compile idt64.c and assemble idt64.S, then register them.
+        c_obj = os.path.join(self.objdir, "idt64_c.o")
+        cmd = ([gcc] + self._cflags() + ["-I", kdir, "-I", incdir, "-c",
+                files["src/kernel/idt64.c"], "-o", c_obj] + self._defs())
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(c_obj):
+            raise RuntimeError("idt64.c compile failed:\n" + r.stderr)
+        s_obj = os.path.join(self.objdir, "idt64_s.o")
+        self._assemble(files["src/kernel/idt64.S"], s_obj)
+
+        for rel, obj in (("src/kernel/idt64.c", c_obj), ("src/kernel/idt64.S", s_obj)):
+            self._obj[rel] = obj
+            self._undef[rel] = _undef_syms(obj, nm)
+            self._provider.update({s: rel for s in _defined_syms(obj, nm)})
+        self._idt64_installed = True
+        self._log("installed 64-bit IDT overrides (idt64.c + idt64.S; idt.c removed)")
+
     def _assemble(self, src, obj):
         as_tool = _tool("as")
         flag = "--64" if self.bits == 64 else "--32"
@@ -243,6 +279,7 @@ class BareMetalLinker:
         if self.bits != 64:
             raise RuntimeError("bootable images are 64-bit; boot64.S targets long mode")
         self._build_pool()
+        self._install_idt64_overrides()
         nm = _tool("nm")
 
         # boot stub + linker script from minikraft.py
