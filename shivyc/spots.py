@@ -1,5 +1,27 @@
 """The Spot object definition and and some predefined spots, like registers."""
 
+from __future__ import annotations
+
+
+# GNU assembler Intel-syntax expression operators. A C identifier that is
+# spelled exactly like one of these cannot be emitted as a bare symbol name --
+# `as` parses e.g. `[shr]` as the shift operator, not a label (gcc avoids this
+# only because it emits AT&T syntax). musl has a `static inline shr()` in
+# qsort.c. We rename such symbols consistently at every definition and
+# reference. The mapping is idempotent and only touches these few names, so
+# normal symbols (and cross-TU linkage within ShivyC output) are unaffected.
+_ASM_RESERVED = {
+    "shr", "shl", "and", "or", "xor", "not", "mod",
+    "eq", "ne", "lt", "le", "gt", "ge", "offset",
+}
+
+
+def mangle_symbol(name: str) -> str:
+    """Rename a symbol whose spelling collides with a GNU-as operator."""
+    if name in _ASM_RESERVED:
+        return "__shivyc_sym_" + name
+    return name
+
 
 class Spot:
     """Spot in the machine where an IL value can be.
@@ -11,7 +33,7 @@ class Spot:
 
     """
 
-    def __init__(self, detail):
+    def __init__(self, detail) -> None:
         """Initialize a spot.
 
         `detail` should uniquely represent this Spot for this specific spot
@@ -19,7 +41,7 @@ class Spot:
         """
         self.detail = detail
 
-    def asm_str(self, size):
+    def asm_str(self, size: int) -> str:
         """Make the ASM form of this spot, for the given size in bytes.
 
         This function raises NotImplementedError for unsupported sizes.
@@ -36,7 +58,7 @@ class Spot:
         """
         raise NotImplementedError
 
-    def rbp_offset(self):
+    def rbp_offset(self) -> int:
         """Return this spot's offset from RBP.
 
         If this is a memory spot which resides at a certain negative offset
@@ -47,7 +69,7 @@ class Spot:
         """
         return 0
 
-    def shift(self, chunk, count=None):
+    def shift(self, chunk: int, count=None) -> 'Spot':
         """Return a new spot shifted relative to this one.
 
         For non-memory spots, this function returns itself and throws an
@@ -57,17 +79,17 @@ class Spot:
             raise NotImplementedError("cannot shift this spot type")
         return self
 
-    def __repr__(self):  # pragma: no cover
+    def __repr__(self) -> str:  # pragma: no cover
         return self.detail
 
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         """Test equality by comparing Spot type and detail."""
         if self.__class__.__name__ != other.__class__.__name__:
             return False
 
         return self.detail == other.detail
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         """Hash based on type and detail."""
         return hash((self.__class__.__name__, self.detail))
 
@@ -91,7 +113,7 @@ class RegSpot(Spot):
                "rbp": ["rbp", "", "", ""],
                "rsp": ["rsp", "", "", ""]}
 
-    def __init__(self, name):
+    def __init__(self, name: str) -> None:
         """Initialize this spot.
 
         `name` is the string representation of the 64-bit register (e.g.
@@ -100,7 +122,7 @@ class RegSpot(Spot):
         super().__init__(name)
         self.name = name
 
-    def asm_str(self, size):  # noqa D102
+    def asm_str(self, size: int) -> str:  # noqa D102
         if size == 0 or size == 8:
             i = 0
         elif size == 1:
@@ -128,7 +150,7 @@ class MemSpot(Spot):
                 4: "DWORD PTR ",
                 8: "QWORD PTR "}
 
-    def __init__(self, base, offset=0, chunk=0, count=None):  # noqa D102
+    def __init__(self, base, offset: int = 0, chunk: int = 0, count=None) -> None:  # noqa D102
         super().__init__((base, offset, chunk, count))
 
         self.base = base
@@ -136,11 +158,11 @@ class MemSpot(Spot):
         self.chunk = chunk
         self.count = count
 
-    def asm_str(self, size):  # noqa D102
+    def asm_str(self, size: int) -> str:  # noqa D102
         if isinstance(self.base, Spot):
             base_str = self.base.asm_str(0)
         else:
-            base_str = self.base
+            base_str = mangle_symbol(self.base)
 
         total_offset = self.offset
         if not self.count:
@@ -163,13 +185,13 @@ class MemSpot(Spot):
         size_desc = self.size_map.get(size, "")
         return f"{size_desc}[{final}]"
 
-    def rbp_offset(self):  # noqa D102
+    def rbp_offset(self) -> int:  # noqa D102
         if self.base == RBP:
             return -self.offset
         else:
             return 0
 
-    def shift(self, chunk, count=None):  # noqa D102
+    def shift(self, chunk: int, count=None) -> 'Spot':  # noqa D102
         """Return a new memory spot shifted relative to this one.
 
         chunk - A Python integer representing the size of each chunk of offset
@@ -200,11 +222,11 @@ class LiteralSpot(Spot):
     this literal.
     """
 
-    def __init__(self, value):
+    def __init__(self, value) -> None:
         super().__init__(value)
         self.value = value
 
-    def asm_str(self, size):  # noqa D102
+    def asm_str(self, size: int) -> str:  # noqa D102
         return str(self.value)
 
 
@@ -213,6 +235,28 @@ class LiteralSpot(Spot):
 
 RAX = RegSpot("rax")
 RCX = RegSpot("rcx")
+
+
+class XmmRegSpot(Spot):
+    """Spot representing an SSE (xmm) register; name is size-independent."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+    def asm_str(self, size: int) -> str:  # noqa D102
+        return self.name
+
+
+XMM0 = XmmRegSpot("xmm0")
+XMM1 = XmmRegSpot("xmm1")
+XMM2 = XmmRegSpot("xmm2")
+XMM3 = XmmRegSpot("xmm3")
+XMM4 = XmmRegSpot("xmm4")
+XMM5 = XmmRegSpot("xmm5")
+XMM6 = XmmRegSpot("xmm6")
+XMM7 = XmmRegSpot("xmm7")
+xmm_arg_regs = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7]
 RDX = RegSpot("rdx")
 RSI = RegSpot("rsi")
 RDI = RegSpot("rdi")

@@ -23,6 +23,14 @@ class CType:
         # function for the struct.
         self._orig = self
 
+    def alignment(self):
+        """Return the type's natural (ABI) alignment in bytes.
+
+        For scalar types this equals the size (char=1 .. 8-byte types=8).
+        Aggregate types override this. Used by `_Alignof`.
+        """
+        return self.size if self.size and self.size <= 8 else 8
+
     def weak_compat(self, other):
         """Check for weak compatibility with `other` ctype.
 
@@ -52,6 +60,10 @@ class CType:
 
     def is_integral(self):
         """Check whether this is an integral type."""
+        return False
+
+    def is_floating(self):
+        """Check whether this is a floating-point type."""
         return False
 
     def is_pointer(self):
@@ -153,6 +165,32 @@ class IntegerCType(CType):
         return unsig_self
 
 
+class FloatCType(CType):
+    """Represents a floating-point C type, like 'float' or 'double'."""
+
+    def __init__(self, size, long_double=False):
+        super().__init__(size)
+        # True only for the unsupported 80-bit long double type. It is allowed
+        # to appear in prototypes but rejected where it would allocate storage
+        # or perform arithmetic (see the long-double checks in the tree).
+        self.long_double = long_double
+
+    def weak_compat(self, other):
+        return other._orig == self._orig
+
+    def is_complete(self):
+        return True
+
+    def is_object(self):
+        return True
+
+    def is_arith(self):
+        return True
+
+    def is_floating(self):
+        return True
+
+
 class VoidCType(CType):
     """Represents a void C type.
 
@@ -223,6 +261,10 @@ class ArrayCType(CType):
         self.n = n
         super().__init__((n or 1) * self.el.size)
 
+    def alignment(self):
+        """An array's alignment is that of its element type."""
+        return self.el.alignment()
+
     def compatible(self, other):
         """Return True iff other is a compatible type to self."""
         return (other.is_array() and self.el.compatible(other.el)
@@ -260,6 +302,7 @@ class FunctionCType(CType):
         self.args = args
         self.ret = ret
         self.no_info = no_info
+        self.variadic = False
         super().__init__(1)
 
     def weak_compat(self, other):
@@ -302,7 +345,17 @@ class _UnionStructCType(CType):
         self.tag = tag
         self.members = members
         self.offsets = {}
+        # Map from member name to (bit_width, signed) for any member declared
+        # as a bitfield. Members not in this map are ordinary members.
+        self.bitfields = {}
         super().__init__(1)
+
+    def alignment(self):
+        """A struct/union's alignment is the max alignment of its members
+        (regardless of ShivyC's packed layout). Used by `_Alignof`."""
+        if not self.members:
+            return 1
+        return max((c.alignment() for _, c in self.members), default=1)
 
     def weak_compat(self, other):
         """Return True if other is a compatible type to self.
@@ -334,24 +387,89 @@ class _UnionStructCType(CType):
         """
         return self.offsets.get(member, (None, None))
 
-    def set_members(self, members):
+    def get_bitfield(self, member):
+        """Return (bit_width, signed) if member is a bitfield, else None."""
+        return self.bitfields.get(member)
+
+    def set_members(self, members, bitfields=None):
         """Add the given members to this type.
 
         The members list is given in the format as described in the class
-        description.
+        description. `bitfields` optionally maps member names to
+        (bit_width, signed) tuples.
         """
         raise NotImplementedError
+
+    def _promote_anon(self, member, ctype, base_offset):
+        """Promote members of a C11 anonymous struct/union member.
+
+        An anonymous member (internal name "<anon-member-N>") makes its own
+        members accessible directly on the enclosing struct/union, at the
+        anonymous member's base_offset plus each inner member's offset. Inner
+        anonymous members are already promoted within `ctype.offsets`, so this
+        flattens arbitrarily nested anonymous members.
+        """
+        if not (isinstance(member, str)
+                and member.startswith("<anon-member-")
+                and ctype.is_struct_union()):
+            return
+        for inner_name, (inner_off, inner_ctype) in ctype.offsets.items():
+            if inner_name.startswith("<anon-member-"):
+                continue
+            self.offsets[inner_name] = (base_offset + inner_off, inner_ctype)
+            bf = ctype.bitfields.get(inner_name)
+            if bf is not None:
+                self.bitfields[inner_name] = bf
 
 
 class StructCType(_UnionStructCType):
     """Represents a struct ctype."""
 
-    def set_members(self, members):
+    def set_members(self, members, bitfields=None):
+        import shivyc.member_elim as member_elim
+        has_anon = any(isinstance(m, str) and m.startswith("<")
+                       for m, _ in members)
+
+        if member_elim.collecting():
+            # Whole-program analysis: record this struct's named members, and
+            # mark layout-exposing situations ineligible.
+            if has_anon:
+                # Structs with anonymous members (e.g. PyObject) are too
+                # intricate to shrink safely; keep all members.
+                member_elim.mark_ineligible(self.tag)
+            member_elim.record_all_members(
+                self.tag,
+                [m for m, _ in members
+                 if isinstance(m, str) and not m.startswith("<")])
+            # A nested struct/union (or array thereof) has its layout exposed
+            # through this enclosing object, so it must keep all members.
+            for _, ctype in members:
+                inner = ctype
+                while inner.is_array():
+                    inner = inner.el
+                if inner.is_struct_union():
+                    member_elim.mark_ineligible(getattr(inner, "tag", None))
+        else:
+            # Real compile: drop members the analysis proved unused (never any
+            # synthetic anonymous-member placeholder).
+            rem = member_elim.removable_for(self.tag)
+            if rem:
+                members = [(m, c) for (m, c) in members if m not in rem]
+                if bitfields:
+                    bitfields = {m: b for m, b in bitfields.items()
+                                 if m not in rem}
+
         self.members = members
+        self.bitfields = bitfields or {}
 
         cur_offset = 0
         for member, ctype in members:
             self.offsets[member] = cur_offset, ctype
+            self._promote_anon(member, ctype, cur_offset)
+            # A flexible array member (an incomplete array, always the last
+            # member -- enforced by the caller) occupies no space.
+            if ctype.is_array() and ctype.is_incomplete():
+                continue
             cur_offset += ctype.size
 
         self.size = cur_offset
@@ -363,11 +481,23 @@ class UnionCType(_UnionStructCType):
     Similar to struct type, but different offset is used.
     """
 
-    def set_members(self, members):
+    def set_members(self, members, bitfields=None):
+        import shivyc.member_elim as member_elim
+        if member_elim.collecting():
+            # A struct sharing storage with other union members has its layout
+            # exposed; it must keep all members.
+            for _, ctype in members:
+                inner = ctype
+                while inner.is_array():
+                    inner = inner.el
+                if inner.is_struct_union():
+                    member_elim.mark_ineligible(getattr(inner, "tag", None))
         self.members = members
+        self.bitfields = bitfields or {}
         self.size = max([ctype.size for _, ctype in members], default=0)
         for member, ctype in members:
             self.offsets[member] = 0, ctype
+            self._promote_anon(member, ctype, 0)
 
 
 # These definitions are here to permit convenient creation of new integer,
@@ -401,9 +531,21 @@ long_max = 9223372036854775807
 long_min = -9223372036854775808
 
 
+flt = FloatCType(4)
+dbl = FloatCType(8)
+longdouble = FloatCType(8, long_double=True)
+
+# Set True by the -f-long-double-as-double flag. When set, `long double` is
+# aliased to `double` (64-bit) with a warning instead of being rejected. This
+# compiler never implements true 80-bit extended precision.
+long_double_as_double = False
+
+
 simple_types = {token_kinds.void_kw: void,
                 token_kinds.bool_kw: bool_t,
                 token_kinds.char_kw: char,
                 token_kinds.short_kw: short,
                 token_kinds.int_kw: integer,
-                token_kinds.long_kw: longint}
+                token_kinds.long_kw: longint,
+                token_kinds.float_kw: flt,
+                token_kinds.double_kw: dbl}

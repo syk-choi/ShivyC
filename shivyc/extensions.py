@@ -1,0 +1,335 @@
+"""C language extensions for ShivyC.
+
+This module is a source pre-pass that recognizes a few non-standard
+extensions, records them as per-function metadata, and blanks them out of the
+source (preserving byte offsets and newlines, so error line/column numbers are
+unaffected) before ShivyC's ordinary C lexer ever sees them.
+
+Two kinds of extension are supported, both attached to a function *definition*
+in the region between the parameter list `)` and the body `{`:
+
+1. Function specifiers, borrowing the GNU `__attribute__` spelling style:
+
+       void f() __stackless__   { ... }   // opt in to stackless lowering
+       void f() __metamorphic__ { ... }   // opt in to metamorphic returns
+
+   These give per-function control over optimizations that would otherwise be
+   whole-program flags.
+
+2. Contract blocks, borrowing Python's `assert` syntax and parsed with the
+   standard-library `ast` module (the approach prototyped in arx86.py):
+
+       extern float calc_sum(float *ptr, unsigned int len)
+       assert len(ptr) >= 64
+       assert not len(ptr) % 4096
+       { ... }
+
+   Each assert states a compile-time contract about an argument. `len(p) >= N`
+   and `len(p) <= N` bound an array's element count; `not len(p) % N` asserts
+   the count is a multiple of N. Downstream passes use these to prove, from the
+   call graph, that a loop can be vectorized with no scalar remainder.
+
+The pre-pass deliberately leaves ordinary C untouched: a header whose
+inter-`)`-and-`{` region is only whitespace is not an extended definition.
+"""
+
+import ast
+import re
+
+# A candidate function name immediately followed by its parameter list's open
+# paren. We pair the parens structurally (regex can't), then look at what sits
+# between the close paren and the body's `{`.
+_NAME_PAREN_RE = re.compile(r"(?P<name>[A-Za-z_]\w*)\s*\(")
+
+_SPECIFIERS = {"__stackless__", "__metamorphic__"}
+
+
+def _blank_preproc_directives(code):
+    """Return a copy of `code` with preprocessor directive lines (and their
+    backslash continuations) replaced by spaces, newlines preserved.
+
+    A function-like macro body may use a name like `PyObject_TypeCheck(...)` on
+    a continuation line of a `#define`; that is not a function definition, so
+    the extension scan must not treat it as one. The `#`-line check below only
+    catches the first physical line of a directive, so we blank continuations
+    here.
+    """
+    out = list(code)
+    pos = 0
+    in_directive = False
+    for line in code.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("#") or in_directive:
+            for k in range(len(line)):
+                if out[pos + k] != "\n":
+                    out[pos + k] = " "
+            in_directive = line.rstrip().endswith("\\")
+        else:
+            in_directive = False
+        pos += len(line) + 1
+    return "".join(out)
+
+
+def _blank_comments_and_strings(code):
+    """Return a copy of `code` with comment and string/char-literal contents
+    replaced by spaces (newlines preserved), so byte offsets and line numbers
+    are unchanged.
+
+    The extension scan must not treat a function-name-like token that appears
+    inside a comment or string literal as a real definition header -- e.g.
+    `/* ... _PyDict_CheckConsistency() */` would otherwise be mistaken for a
+    function whose "region" runs across unrelated code.
+    """
+    out = list(code)
+    i, n = 0, len(code)
+    while i < n:
+        c = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and code[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif c == "/" and nxt == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and not (code[i] == "*" and i + 1 < n
+                                 and code[i + 1] == "/"):
+                if code[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+        elif c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < n and code[i] != quote:
+                if code[i] == "\\" and i + 1 < n:
+                    if code[i] != "\n":
+                        out[i] = " "
+                    if code[i + 1] != "\n":
+                        out[i + 1] = " "
+                    i += 2
+                    continue
+                if code[i] != "\n":
+                    out[i] = " "
+                i += 1
+            i += 1  # skip closing quote
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _match_paren(code, open_idx):
+    """Return the index of the `)` matching the `(` at `open_idx`, or None."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _region_after_params(code, close_idx):
+    """Scan from after `)` to the body `{`, returning (region, brace_idx).
+
+    Returns (None, None) if a `;` (prototype / statement) or EOF is hit first.
+    Parens inside the region (e.g. `len(ptr)`) are tolerated.
+    """
+    depth = 0
+    i = close_idx + 1
+    while i < len(code):
+        ch = code[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            # An unmatched ')' means the matched name(...) was a call nested
+            # in an enclosing parenthesized expression (e.g. `if (f(x)) {`),
+            # not a function-definition header. Such a region is never an
+            # extension; bail so we do not scan past the real body brace.
+            if depth < 0:
+                return None, None
+        elif depth == 0 and ch == ";":
+            return None, None
+        elif depth == 0 and ch == "{":
+            return code[close_idx + 1:i], i
+        i += 1
+    return None, None
+
+
+def _looks_like_extension(region):
+    """True if the region is plausibly an extension (vs. unrelated code)."""
+    stripped = region.strip()
+    return stripped.startswith("__") or "assert" in stripped
+
+
+class ExtensionInfo:
+    """Per-function extension metadata, keyed by function name."""
+
+    def __init__(self):
+        # name -> set of specifier strings (without the surrounding __)
+        self.attrs = {}
+        # name -> {arg_name -> {'len>=': int, 'len<=': int, 'div-by': int}}
+        self.contracts = {}
+
+    def attrs_of(self, name):
+        return self.attrs.get(name, set())
+
+    def has_attr(self, name, attr):
+        return attr in self.attrs.get(name, set())
+
+    def contracts_of(self, name):
+        return self.contracts.get(name, {})
+
+    def __bool__(self):
+        return bool(self.attrs) or bool(self.contracts)
+
+
+def preprocess_extensions(code):
+    """Strip extensions from `code`; return (clean_code, ExtensionInfo).
+
+    Blanked regions are replaced space-for-space (newlines preserved) so the
+    cleaned source has identical byte offsets to the original.
+    """
+    info = ExtensionInfo()
+    chars = list(code)
+    consumed_until = 0  # ignore matches inside an already-claimed region
+
+    # Scan a copy with comments and string/char literals blanked out, so a
+    # name-like token inside a comment or string is never mistaken for a
+    # function definition header. Offsets are identical to `code`, so indices
+    # found here apply directly to `chars`.
+    scan = _blank_preproc_directives(_blank_comments_and_strings(code))
+
+    for m in _NAME_PAREN_RE.finditer(scan):
+        if m.start() < consumed_until:
+            continue
+        # Ignore matches inside a preprocessor directive line (e.g. a
+        # function-like macro definition `#define likely(x) ...`), which is
+        # not a function definition with an extension region.
+        line_start = scan.rfind("\n", 0, m.start()) + 1
+        if scan[line_start:m.start()].lstrip().startswith("#"):
+            continue
+        open_idx = m.end() - 1
+        close_idx = _match_paren(scan, open_idx)
+        if close_idx is None:
+            continue
+        region, brace_idx = _region_after_params(scan, close_idx)
+        if region is None or not region.strip():
+            continue
+        if not _looks_like_extension(region):
+            continue
+
+        name = m.group("name")
+        attrs, contracts = _parse_region(region, name)
+        if attrs:
+            info.attrs.setdefault(name, set()).update(attrs)
+        if contracts:
+            info.contracts.setdefault(name, {}).update(contracts)
+
+        # Blank the region in place (preserving newlines and byte offsets).
+        for idx in range(close_idx + 1, brace_idx):
+            if chars[idx] != "\n":
+                chars[idx] = " "
+        consumed_until = brace_idx
+
+    return "".join(chars), info
+
+
+def _parse_region(region, func_name):
+    """Extract specifiers and contracts from a header region."""
+    attrs = set()
+    contracts = {}
+
+    # Pull out specifier tokens first; whatever remains should be asserts.
+    def take_specifier(match):
+        attrs.add(match.group(0).strip("_"))
+        return " " * len(match.group(0))
+
+    remaining = re.sub(r"__[A-Za-z_]\w*__", take_specifier, region)
+
+    for line in remaining.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("assert"):
+            raise ExtensionError(
+                f"unexpected text in extension region of '{func_name}': "
+                f"{line!r}")
+        arg, contract = _parse_assert(line, func_name)
+        contracts.setdefault(arg, {}).update(contract)
+
+    return attrs, contracts
+
+
+def _parse_assert(line, func_name):
+    """Parse one `assert` contract line via the `ast` module.
+
+    Recognizes:
+        assert len(x) >= N      -> ('x', {'len>=': N})
+        assert len(x) <= N      -> ('x', {'len<=': N})
+        assert not len(x) % N   -> ('x', {'div-by': N})
+    """
+    try:
+        node = ast.parse(line, mode="exec").body[0]
+    except SyntaxError as e:
+        raise ExtensionError(
+            f"invalid contract in '{func_name}': {line!r} ({e})")
+
+    if not isinstance(node, ast.Assert):
+        raise ExtensionError(f"expected an assert in '{func_name}': {line!r}")
+
+    test = node.test
+
+    # assert not len(x) % N  -> divisibility
+    if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.BinOp)
+            and isinstance(test.operand.op, ast.Mod)):
+        arg = _len_arg(test.operand.left, func_name, line)
+        n = _const_int(test.operand.right, func_name, line)
+        return arg, {"div-by": n}
+
+    # assert len(x) >= N  /  assert len(x) <= N
+    if (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and len(test.comparators) == 1):
+        arg = _len_arg(test.left, func_name, line)
+        n = _const_int(test.comparators[0], func_name, line)
+        if isinstance(test.ops[0], ast.GtE):
+            return arg, {"len>=": n}
+        if isinstance(test.ops[0], ast.LtE):
+            return arg, {"len<=": n}
+        raise ExtensionError(
+            f"unsupported comparison in '{func_name}': {line!r}")
+
+    raise ExtensionError(f"unsupported contract in '{func_name}': {line!r}")
+
+
+def _len_arg(node, func_name, line):
+    """Require `len(name)` and return `name`."""
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "len" and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)):
+        return node.args[0].id
+    raise ExtensionError(
+        f"contract must use len(arg) in '{func_name}': {line!r}")
+
+
+def _const_int(node, func_name, line):
+    """Require a non-negative integer constant."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    raise ExtensionError(
+        f"contract bound must be an integer constant in '{func_name}': "
+        f"{line!r}")
+
+
+class ExtensionError(Exception):
+    """Raised when an extension region is malformed."""

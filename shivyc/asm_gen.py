@@ -4,7 +4,22 @@ import itertools
 
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
+from shivyc.spots import mangle_symbol
+import shivyc.simd_pack as simd_pack
 from shivyc.spots import Spot, RegSpot, MemSpot, LiteralSpot
+
+
+
+def _float_to_bits(val, size):
+    """If `val` is a float, return its IEEE-754 bit pattern as an integer
+    suitable for a .int/.quad directive; otherwise return `val` unchanged.
+    Integer initializers are Python ints and pass through untouched."""
+    if isinstance(val, float):
+        import struct
+        if size == 4:
+            return struct.unpack("<I", struct.pack("<f", val))[0]
+        return struct.unpack("<Q", struct.pack("<d", val))[0]
+    return val
 
 
 class ASMCode:
@@ -46,35 +61,73 @@ class ASMCode:
         name (str) - The name to add.
 
         """
-        self.globals.append(f"\t.global {name}")
+        self.globals.append(f"\t.global {mangle_symbol(name)}")
+
+    def add_weak(self, name):
+        """Mark a symbol as having weak linkage (emits `.weak name`)."""
+        self.globals.append(f"\t.weak {mangle_symbol(name)}")
+
+    def add_alias(self, name, target):
+        """Emit an assembler alias making `name` resolve to `target`."""
+        self.globals.append(f"\t.set {mangle_symbol(name)}, {mangle_symbol(target)}")
 
     def add_data(self, name, size, init):
         """Add static data to the code.
 
         init - the value to initialize `name` to
         """
-        self.data.append(f"{name}:")
+        self.data.append(f"{mangle_symbol(name)}:")
         size_strs = {1: "byte",
                      2: "word",
                      4: "int",
                      8: "quad"}
 
         if init:
-            self.data.append(f"\t.{size_strs[size]} {init}")
+            self.data.append(f"\t.{size_strs[size]} {_float_to_bits(init, size)}")
         else:
             self.data.append(f"\t.zero {size}")
+
+    def add_data_block(self, name, entries, total):
+        """Emit an initialized aggregate static object.
+
+        entries - iterable of (byte_offset, size, value) constant scalars
+        total - total size in bytes; gaps and the tail are zero-filled
+        """
+        self.data.append(f"{mangle_symbol(name)}:")
+        size_strs = {1: "byte", 2: "word", 4: "int", 8: "quad"}
+        pos = 0
+        for off, size, val in sorted(entries, key=lambda e: e[0]):
+            if off > pos:
+                self.data.append(f"\t.zero {off - pos}")
+            if isinstance(val, tuple) and val and val[0] == "sym":
+                _, sym, addend = val
+                msym = mangle_symbol(sym)
+                ref = msym if not addend else f"{msym}+{addend}"
+                self.data.append(f"\t.quad {ref}")
+                size = 8
+            else:
+                self.data.append(
+                    f"\t.{size_strs[size]} {_float_to_bits(val, size)}")
+            pos = off + size
+        if pos < total:
+            self.data.append(f"\t.zero {total - pos}")
 
     def add_comm(self, name, size, local):
         """Add a common symbol to the code."""
         if local:
-            self.comm.append(f"\t.local {name}")
-        self.comm.append(f"\t.comm {name} {size}")
+            self.comm.append(f"\t.local {mangle_symbol(name)}")
+        self.comm.append(f"\t.comm {mangle_symbol(name)} {size}")
 
-    def add_string_literal(self, name, chars):
-        """Add a string literal to the ASM code."""
-        self.string_literals.append(f"{name}:")
+    def add_string_literal(self, name, chars, elem_size=1):
+        """Add a string literal to the ASM code.
+
+        elem_size - bytes per element (1 for char strings, 4 for wide/wchar_t).
+        """
+        from shivyc.spots import mangle_symbol
+        self.string_literals.append(f"{mangle_symbol(name)}:")
+        directive = {1: "byte", 2: "word", 4: "int", 8: "quad"}[elem_size]
         data = ",".join(str(char) for char in chars)
-        self.string_literals.append(f"\t.byte {data}")
+        self.string_literals.append(f"\t.{directive} {data}")
 
     def full_code(self):  # noqa: D202
         """Produce the full assembly code.
@@ -279,12 +332,120 @@ class ASMGen:
 
         self.offset = 0
 
+        # SIMD bit-packing of small global flags (opt-in). The layout is built
+        # in _get_global_spotmap once all static globals are known -- unless a
+        # whole-program layout was supplied (multi-TU build), in which case
+        # every unit uses that single shared, frozen layout and the memory
+        # mirror is a shared common symbol.
+        wp_layout = getattr(arguments, "_simd_pack_layout", None)
+        if wp_layout is not None:
+            self.simd_pack = wp_layout
+            self.simd_pack_enabled = True
+            self._simd_pack_shared = True
+        else:
+            self.simd_pack = simd_pack.SimdPackLayout()
+            self.simd_pack_enabled = getattr(
+                arguments, "simd_pack_globals", False)
+            self._simd_pack_shared = False
+        # Expose to IL commands, which only receive the asm_code object.
+        asm_code.simd_pack = self.simd_pack
+        asm_code.simd_pack_enabled = self.simd_pack_enabled
+        asm_code.simd_pack_hot = False
+
+        # Stackless / low-overhead calls (opt-in). The IL pass annotates Call
+        # commands and records per-function call-structure flags; framelessness
+        # is finalized here once stack offsets are known.
+        self.stackless_enabled = getattr(
+            arguments, "stackless_calls", False)
+        asm_code.frameless = False
+
+        # Metamorphic returns (opt-in via -fmetamorphic + __metamorphic__).
+        asm_code.metamorphic_funcs = set()
+        asm_code.metamorphic_current = None
+
+        # -O4 near-function scratch: per-function static spill/local storage.
+        self._near_active = False        # is the current function using it?
+        self._near_label = None          # its scratch buffer symbol
+        self._near_off = 0               # next free offset within the buffer
+        self._near_size = 0              # high-water mark for this function
+
     def make_asm(self):
         """Generate ASM code."""
         global_spotmap = self._get_global_spotmap()
+
+        # If anything was packed, declare the memory mirror of the SIMD reg.
+        if self.simd_pack.active:
+            self.simd_pack.emit_store_decl(
+                self.asm_code, shared=self._simd_pack_shared)
+
+        # Expose the metamorphic function set so Call can emit the patch+jmp
+        # sequence for calls to them.
+        metamorphic_funcs = getattr(self.il_code, "metamorphic_funcs", set())
+        self.asm_code.metamorphic_funcs = metamorphic_funcs
+        near_scratch_funcs = getattr(self.il_code, "near_scratch_funcs", set())
+
         for func in self.il_code.commands:
+            is_meta = func in metamorphic_funcs
+            if is_meta:
+                # Metamorphic functions live in a writable+executable section
+                # with their return slot placed immediately before them -- the
+                # "writable .text, memory near the function" idea. The slot is
+                # self-modified at run time (the caller patches it).
+                slot = func + "__metaret"
+                self.asm_code.add(
+                    asm_cmds.Raw(".section .mtext,\"awx\",@progbits"))
+                self.asm_code.add(asm_cmds.Raw(slot + ":"))
+                self.asm_code.add(asm_cmds.Raw(".quad 0"))
+                self.asm_code.metamorphic_current = slot
+            else:
+                self.asm_code.metamorphic_current = None
+
+            # -O4 near-function scratch: route this function's locals/spills
+            # into a static per-function buffer instead of the stack.
+            self._near_active = func in near_scratch_funcs
+            self._near_label = func + "__scratch"
+            self._near_off = 0
+            self._near_size = 0
+
             self.asm_code.add(asm_cmds.Label(func))
-            self._make_asm(self.il_code.commands[func], global_spotmap)
+
+            # Contract-proven SIMD reductions get a hand-synthesized,
+            # fallback-free SSE2 body instead of the normal scalar codegen.
+            if func in getattr(self.il_code, "simd_proven", set()):
+                import shivyc.simd_contracts as simd_contracts
+                simd_contracts.synth_sse2_reduce(self.asm_code, None)
+            else:
+                # Tell IL commands whether we are inside a hot/interrupt routine
+                # (controls the zero-latency register read path).
+                self.asm_code.simd_pack_hot = (
+                    self.simd_pack.active and simd_pack.is_hot_function(func))
+                self._cur_func_is_main = (func == "main")
+                self._cur_func_name = func
+                self._make_asm(self.il_code.commands[func], global_spotmap)
+
+            if is_meta:
+                self.asm_code.add(asm_cmds.Raw(".section .text"))
+
+            # Declare the static scratch buffer (BSS) if this function used it.
+            if self._near_active and self._near_size > 0:
+                size = self._near_size + (-self._near_size % 16)  # 16-align
+                self.asm_code.add_comm(self._near_label, size, local=True)
+            self._near_active = False
+
+    def _alloc_stack_slot(self, size):
+        """Allocate a slot for a local/spill, returning its MemSpot.
+
+        Normally this is an rbp-relative stack slot. For a function selected
+        for -O4 near-function scratch, the slot instead lives in a static
+        per-function buffer, so it never touches the stack.
+        """
+        if self._near_active:
+            spot = MemSpot(self._near_label, self._near_off)
+            self._near_off += size
+            self._near_size = max(self._near_size, self._near_off)
+            return spot
+        self.offset += size
+        return MemSpot(spots.RBP, -self.offset)
 
     def _make_asm(self, commands, global_spotmap):
         """Generate ASM code for given command list."""
@@ -308,6 +469,10 @@ class ASMGen:
             if v.ctype.size not in {1, 2, 4, 8}:
                 move_to_mem.append(v)
 
+        for v in free_values:
+            if v.ctype.is_floating():
+                move_to_mem.append(v)
+
         # TODO: All non-free IL values are automatically assigned distinct
         # memory spots. However, this is very inoptimal for structs.
         # Consider the following C code, where S is already declared:
@@ -326,6 +491,9 @@ class ASMGen:
         # copy operations and memory usage. This also requires that the
         # relevant IL commands check whether the two arguments are in the
         # same spot before trying to do a copy.
+        # Address-taken locals must keep their normal stack layout: their
+        # addresses are observable (and some programs do pointer arithmetic
+        # across them), so they are never relocated to near-function scratch.
         for v in move_to_mem:
             if v in free_values:
                 self.offset += v.ctype.size
@@ -387,8 +555,7 @@ class ASMGen:
 
         # Assign stack values to the spilled nodes
         for v in spilled_nodes:
-            self.offset += v.ctype.size
-            spotmap[v] = MemSpot(spots.RBP, -self.offset)
+            spotmap[v] = self._alloc_stack_slot(v.ctype.size)
 
         # Merge global spotmap into this spotmap
         for v in global_spotmap:
@@ -428,11 +595,20 @@ class ASMGen:
         num = 0
 
         for value in (set(self.il_code.literals.keys())
+                      | set(self.il_code.float_literals.keys())
                       | set(self.il_code.string_literals.keys())
                       | set(self.symbol_table.storage.keys())):
             num += 1
             spot = self._get_nondynamic_spot(value, num)
             if spot: global_spotmap[value] = spot
+
+            # Detect qualifying small static globals for SIMD bit-packing.
+            if (self.simd_pack_enabled
+                    and isinstance(spot, MemSpot)
+                    and isinstance(spot.base, str)
+                    and self.symbol_table.storage.get(value)
+                    == self.symbol_table.STATIC):
+                self.simd_pack.consider(spot.base, value.ctype.size)
 
         externs = self.symbol_table.linkages[EXTERNAL].values()
         for v in externs:
@@ -459,10 +635,23 @@ class ASMGen:
         if v in self.il_code.literals:
             return LiteralSpot(self.il_code.literals[v])
 
+        elif v in self.il_code.float_literals:
+            import struct
+            name = f"__fltlit{num}"
+            val = self.il_code.float_literals[v]
+            if v.ctype.size == 4:
+                bits = struct.unpack("<I", struct.pack("<f", val))[0]
+                self.asm_code.add_data(name, 4, bits)
+            else:
+                bits = struct.unpack("<Q", struct.pack("<d", val))[0]
+                self.asm_code.add_data(name, 8, bits)
+            return MemSpot(name)
+
         elif v in self.il_code.string_literals:
-            name = f"__strlit{num}"
+            name = self.il_code.string_literal_names.get(v, f"__strlit{num}")
+            elem_size = v.ctype.el.size if v.ctype.is_array() else 1
             self.asm_code.add_string_literal(
-                name, self.il_code.string_literals[v])
+                name, self.il_code.string_literals[v], elem_size)
             return MemSpot(name)
 
         # Values with no storage can be referenced directly by name
@@ -470,13 +659,14 @@ class ASMGen:
             return MemSpot(self.symbol_table.names[v])
 
         elif self.symbol_table.storage.get(v) == self.symbol_table.STATIC:
-            name = self.symbol_table.names[v]
-            if self.symbol_table.linkage_type.get(v) != EXTERNAL:
-                name = f"{name}.{num}"
+            name = self.symbol_table.asm_name(v)
 
             if self.symbol_table.def_state.get(v) == TENTATIVE:
                 local = (self.symbol_table.linkage_type[v] == INTERNAL)
                 self.asm_code.add_comm(name, v.ctype.size, local)
+            elif v in self.il_code.static_block_inits:
+                entries, total = self.il_code.static_block_inits[v]
+                self.asm_code.add_data_block(name, entries, total)
             else:
                 init_val = self.il_code.static_inits.get(v, 0)
                 self.asm_code.add_data(name, v.ctype.size, init_val)
@@ -680,23 +870,28 @@ class ASMGen:
         first element is the preserved node, and the second element is the
         removed node.
         """
+        # Cache each node's conflict set once for this pass: membership tests
+        # and unions below are otherwise linear scans of conflict lists, which
+        # dominated compile time on large functions.
+        confs_set = {n: set(g.confs(n)) for n in g.all_nodes()}
+        nreg = len(self.alloc_registers)
         for v1 in g.nodes():
             for v2 in g.prefs(v1):
                 # If the two nodes conflict, automatically continue.
-                if v1 in g.confs(v2):
+                if v2 in confs_set[v1]:
                     continue
 
-                total_confs = len(set(g.confs(v1)) | set(g.confs(v2)))
+                total_confs = len(confs_set[v1] | confs_set[v2])
 
                 # If one is a spot, use a special heuristic.
                 # (described on section 6, page 311 of George & Appel)
                 if isinstance(v1, Spot):
                     v1, v2 = v2, v1
                 if isinstance(v2, Spot):
-                    for T in g.confs(v1):
-                        if v2 in g.confs(T):
+                    for T in confs_set[v1]:
+                        if v2 in confs_set[T]:
                             continue
-                        if len(g.confs(T)) < len(self.alloc_registers):
+                        if len(confs_set[T]) < nreg:
                             continue
                         break
                     else:
@@ -705,7 +900,7 @@ class ASMGen:
                         return v2, v1
 
                 # Otherwise, apply regular merging rules.
-                elif total_confs < len(self.alloc_registers):
+                elif total_confs < nreg:
                     g.merge(v1, v2)
                     return v1, v2
 
@@ -717,22 +912,29 @@ class ASMGen:
         is removed from the graph. Returns false iff nothing is done.
         """
 
-        # Sort a list of nodes by conflict degree
+        # Rank nodes by conflict degree (low first).
         nodes = sorted(g.all_nodes(), key=lambda n: len(g.confs(n)))
-        index_pairs = list(itertools.combinations(list(enumerate(nodes)), 2))
+        pos = {n: i for i, n in enumerate(nodes)}
 
-        # Sort pairs to prioritize nodes which appear earlier in `nodes`
-        index_pairs.sort(key=lambda p: p[0][0] + p[1][0])
+        # Find the preference edge whose endpoints have the lowest combined
+        # rank, preferring to freeze edges between low-degree nodes. Iterate
+        # preference edges directly rather than enumerating and sorting all
+        # O(V^2) node pairs (which made this step cubic in the graph size and
+        # dominated compile time on large functions).
+        best = None
+        best_key = None
+        for n1 in nodes:
+            p1 = pos[n1]
+            for n2 in g.prefs(n1):
+                p2 = pos[n2]
+                key = (p1 + p2, min(p1, p2), max(p1, p2))
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = (n1, n2)
 
-        # Extract just the node pairs
-        pairs = [(p[0][1], p[1][1]) for p in index_pairs]
-
-        # Now, the earlier pairs in `pairs` have lower conflict degree and
-        # are thus superior candidates for freezing.
-        for n1, n2 in pairs:
-            if n1 in g.prefs(n2):
-                g.remove_pref(n1, n2)
-                return True
+        if best is not None:
+            g.remove_pref(best[0], best[1])
+            return True
 
         return False
 
@@ -790,40 +992,139 @@ class ASMGen:
 
         # This is kinda hacky...
         max_offset = max(spot.rbp_offset() for spot in spotmap.values())
+
+        # Decide framelessness BEFORE generating the body: a function with no
+        # stack-resident locals and no non-tail call needs no rbp frame at all.
+        # The Return command reads asm_code.frameless while the body is being
+        # generated, so this decision must be fixed up front. It cannot depend
+        # on register-scratch spilling discovered during generation -- so a
+        # frameless function parks scratch in the red zone (see below), which
+        # needs no frame, keeping the decision independent of scratch.
+        base_offset = max_offset
+        if base_offset % 16 != 0:
+            base_offset += 16 - base_offset % 16
+        frameless = False
+        info = getattr(self.il_code, "stackless_info", {})
+        fn_info = info.get(self._cur_func_name)
+        if fn_info is not None:
+            frameless = (base_offset == 0
+                         and fn_info.get("no_regular_call", False))
+        # A function that receives arguments on the stack reads them relative
+        # to rbp ([rbp+16], ...), so it must keep a real frame.
+        if any(getattr(cmd, "stack_spot", None) is not None
+               for cmd in commands):
+            frameless = False
+        self.asm_code.frameless = frameless
+
+        # Per-command register-scratch spill pool. When every allocatable
+        # register holds a value live across a command, handing out a scratch
+        # register requires parking one such value in memory for the duration
+        # of that command. Slots are allocated lazily (only when a command
+        # actually runs out of registers) and reused across commands, so a
+        # function that never exhausts its registers reserves nothing. The home
+        # for a scratch slot depends on the function: an -O4 near-scratch
+        # function uses its static buffer; a frameless leaf uses the System V
+        # red zone (128 bytes below rsp, safe for leaf functions, no frame
+        # needed); any other function uses a real rbp-relative stack slot,
+        # which grows the frame.
+        scratch_pool = []
+
+        def alloc_scratch():
+            if self._near_active:
+                return self._alloc_stack_slot(8)
+            if frameless:
+                return MemSpot(spots.RSP, -8 * (len(scratch_pool) + 1))
+            return self._alloc_stack_slot(8)
+
+        # Generate the body into a buffer first: scratch slots are discovered
+        # during generation, but the prologue that reserves them must precede
+        # the body. Redirect emitted lines into `body` for the duration.
+        body = []
+        saved_lines = self.asm_code.lines
+        self.asm_code.lines = body
+        try:
+            for i, command in enumerate(commands):
+                self.asm_code.add(
+                    asm_cmds.Comment(type(command).__name__.upper()))
+
+                # Registers parked in scratch slots for the duration of this
+                # one command, restored right after. List of (reg, slot).
+                spilled_this_cmd = []
+                input_spots = set(spotmap[v] for v in command.inputs()
+                                  if v in spotmap)
+
+                def get_reg(pref=None, conf=None, _i=i, _command=command,
+                            _spilled=spilled_this_cmd, _inputs=input_spots):
+                    if not pref: pref = []
+                    if not conf: conf = []
+
+                    # Bad if holding a variable live both entering and exiting
+                    # this command.
+                    bad_vars = set(live_vars[_i][0]) & set(live_vars[_i][1])
+                    bad_spots = set(spotmap[var] for var in bad_vars)
+
+                    # Free if it is where an output is stored.
+                    for v in _command.outputs():
+                        bad_spots.discard(spotmap[v])
+
+                    # Bad if listed as a conflicting spot.
+                    bad_spots |= set(conf)
+
+                    for s in (pref + self.all_registers):
+                        if isinstance(s, RegSpot) and s not in bad_spots:
+                            return s
+
+                    # No register is free: park a live-across register that
+                    # this command neither reads (an input) nor is already
+                    # using (conf or a prior spill) in a scratch slot, hand it
+                    # out, and restore it after the command finishes.
+                    already = set(r for r, _ in _spilled)
+                    for s in self.all_registers:
+                        if (isinstance(s, RegSpot) and s not in conf
+                                and s not in _inputs and s not in already):
+                            j = len(_spilled)
+                            if j == len(scratch_pool):
+                                scratch_pool.append(alloc_scratch())
+                            slot = scratch_pool[j]
+                            self.asm_code.add(asm_cmds.Mov(slot, s, 8))
+                            _spilled.append((s, slot))
+                            return s
+
+                    raise NotImplementedError("spill required for get_reg")
+
+                command.make_asm(spotmap, spotmap, get_reg, self.asm_code)
+
+                # Restore registers parked for this command's scratch needs.
+                for reg, slot in reversed(spilled_this_cmd):
+                    self.asm_code.add(asm_cmds.Mov(reg, slot, 8))
+        finally:
+            self.asm_code.lines = saved_lines
+
+        # Grow the frame to cover any rbp-relative stack scratch slots that
+        # were allocated (red-zone and near-buffer slots return rbp_offset 0
+        # and so do not affect the frame).
+        for slot in scratch_pool:
+            max_offset = max(max_offset, slot.rbp_offset())
         if max_offset % 16 != 0:
             max_offset += 16 - max_offset % 16
 
-        # Back up rbp and move rsp
-        self.asm_code.add(asm_cmds.Push(spots.RBP, None, 8))
-        self.asm_code.add(asm_cmds.Mov(spots.RBP, spots.RSP, 8))
+        if not frameless:
+            # Back up rbp and move rsp
+            self.asm_code.add(asm_cmds.Push(spots.RBP, None, 8))
+            self.asm_code.add(asm_cmds.Mov(spots.RBP, spots.RSP, 8))
 
-        offset_spot = LiteralSpot(str(max_offset))
-        self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
+            offset_spot = LiteralSpot(str(max_offset))
+            self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
 
-        # Generate code for each command
-        for i, command in enumerate(commands):
-            self.asm_code.add(asm_cmds.Comment(type(command).__name__.upper()))
+        # SIMD bit-packing prologue hooks.
+        if self.simd_pack.active:
+            if getattr(self, "_cur_func_is_main", False):
+                # Seed PACK_REG (and its mirror) from the flags' initial values.
+                self.simd_pack.emit_startup_pack(self.asm_code)
+            elif self.asm_code.simd_pack_hot:
+                # Refresh PACK_REG from the mirror: one read covers all flags,
+                # and keeps us correct despite xmm15 being caller-saved.
+                self.simd_pack.emit_refresh(self.asm_code)
 
-            def get_reg(pref=None, conf=None):
-                if not pref: pref = []
-                if not conf: conf = []
-
-                # Spot is bad if it is containing a variable that is live both
-                # entering and exiting this command.
-                bad_vars = set(live_vars[i][0]) & set(live_vars[i][1])
-                bad_spots = set(spotmap[var] for var in bad_vars)
-
-                # Spot is free if it is where an output is stored.
-                for v in command.outputs():
-                    bad_spots.discard(spotmap[v])
-
-                # Spot is bad if it is listed as a conflicting spot.
-                bad_spots |= set(conf)
-
-                for s in (pref + self.all_registers):
-                    if isinstance(s, RegSpot) and s not in bad_spots:
-                        return s
-
-                raise NotImplementedError("spill required for get_reg")
-
-            command.make_asm(spotmap, spotmap, get_reg, self.asm_code)
+        # Emit the buffered body after the prologue.
+        self.asm_code.lines.extend(body)

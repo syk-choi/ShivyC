@@ -1,50 +1,776 @@
 """Implementation of the ShivyC preprocessor.
 
-Currently, the preprocessor implementation is very simple and only handles
-include directives. Despite this, the implementation is also
-technically incorrect in many ways. For example, it expands #include
-directives wherever they appear, rather than only expanding them when the
-appear at the beginning of a line.
+This preprocessor handles the directives real C code (and library headers like
+musl's) actually use:
+
+* ``#include`` (quoted and angle-bracket headers)
+* ``#define`` -- object-like and function-like macros, including ``#``
+  (stringize), ``##`` (token paste), and variadic ``...`` / ``__VA_ARGS__``
+* ``#undef``
+* ``#if`` / ``#ifdef`` / ``#ifndef`` / ``#elif`` / ``#else`` / ``#endif`` with
+  full integer constant-expression evaluation and the ``defined`` operator
+* ``#error`` (reported) and ``#pragma`` / ``#line`` (ignored)
+
+Macro expansion uses hide sets so a macro is never re-expanded inside its own
+expansion, matching the C rule that prevents infinite recursion.
+
+The implementation operates on the lexer's token stream. Tokens carry source
+line numbers, which is what lets directives (which are line-oriented) be picked
+out of the flat token list.
 """
+
 import pathlib
 
 import shivyc.lexer as lexer
 import shivyc.token_kinds as token_kinds
-
+from shivyc.tokens import Token, parse_c_int
 from shivyc.errors import error_collector, CompilerError
 
 
-def process(tokens, this_file):
+def process(tokens, this_file, macros=None):
     """Process the given tokens and return the preprocessed token list."""
+    if macros is None:
+        macros = {}
+        _seed_builtins(macros)
+    return _Preprocessor(macros).run(tokens, this_file)
 
-    processed = []
+
+# GCC/C extension spellings that appear throughout library headers. These are
+# "hint" constructs ShivyC does not act on, so stripping them (or mapping them
+# to their plain-C equivalent) lets the headers parse. NOTE: this is
+# deliberately limited to constructs that are safe to ignore. Semantically
+# essential extensions -- inline `__asm__`, `_Thread_local`/`__thread`,
+# `_Atomic`, and the `weak`/`alias` attributes -- are NOT silently stripped
+# here, because doing so would produce incorrect code rather than a parse.
+_BUILTIN_PRELUDE = r"""
+#define __extension__
+#define __restrict
+#define __restrict__
+#define restrict
+#define __inline
+#define __inline__
+#define inline
+#define _Noreturn
+#define __volatile__
+#define __volatile
+#define volatile
+#define __asm__ asm
+#define __asm asm
+#define __signed__ signed
+#define __const const
+#define __builtin_expect(x, c) (x)
+#define _Static_assert(...)
+#define static_assert(...)
+"""
+
+
+def _seed_builtins(macros):
+    """Populate `macros` with the GCC-compatibility prelude definitions."""
+    pre = _Preprocessor(macros)
+    pre.run(lexer.tokenize(_BUILTIN_PRELUDE, "<builtin>"), "<builtin>")
+    if _cmdline_define_prelude:
+        pre.run(lexer.tokenize(_cmdline_define_prelude, "<command-line>"),
+                "<command-line>")
+
+
+# Command-line ``-D`` definitions, as a synthetic ``#define`` prelude seeded
+# after the builtins so they behave exactly like definitions at the top of
+# every translation unit.
+_cmdline_define_prelude = (
+    "#define __SHIVYC__ 1\n"
+    "#define __builtin_va_list char *\n"
+    "#define __builtin_va_start(ap, last) "
+    "((ap) = (char *)__builtin_va_start_addr())\n"
+    "#define __builtin_va_end(ap) ((void)((ap) = (char *)0))\n"
+    "#define __builtin_va_copy(dst, src) ((dst) = (src))\n")
+
+
+def set_defines(defines):
+    """Record command-line ``-D`` macros (each ``NAME`` or ``NAME=VALUE``).
+
+    The compiler always predefines ``__SHIVYC__`` so source (e.g. a musl built
+    for this compiler) can detect it with ``#ifdef __SHIVYC__``.
+    """
+    global _cmdline_define_prelude
+    lines = ["#define __SHIVYC__ 1",
+             "#define __builtin_va_list char *",
+             "#define __builtin_va_start(ap, last) "
+             "((ap) = (char *)__builtin_va_start_addr())",
+             "#define __builtin_va_end(ap) ((void)((ap) = (char *)0))",
+             "#define __builtin_va_copy(dst, src) ((dst) = (src))"]
+    for d in defines or []:
+        name, eq, val = d.partition("=")
+        lines.append("#define %s %s" % (name, val if eq else "1"))
+    _cmdline_define_prelude = "\n".join(lines) + ("\n" if lines else "")
+
+
+# ---------------------------------------------------------------------------
+# Token helpers
+# ---------------------------------------------------------------------------
+
+def spell(tok):
+    """Return the source spelling of a token."""
+    if tok.rep:
+        return tok.rep
+    if isinstance(tok.content, str):
+        return tok.content
+    return str(tok.kind)
+
+
+def is_ident(tok):
+    return tok.kind is token_kinds.identifier
+
+
+def ident_name(tok):
+    return tok.content if tok.kind is token_kinds.identifier else None
+
+
+def is_punct(tok, s):
+    return spell(tok) == s
+
+
+def _relex(text, r):
+    """Lex `text` into tokens, giving each the range `r` for diagnostics."""
+    fname = r.start.file if r and r.start else "<pp>"
+    toks = lexer.tokenize(text, fname)
+    for t in toks:
+        t.r = r
+    return toks
+
+
+def _num_token(value, r):
+    """Build a number token for an integer value."""
+    return Token(token_kinds.number, str(value), r=r)
+
+
+def _coalesce(tokens):
+    """Rejoin preprocessor-only multi-character tokens the lexer splits.
+
+    ShivyC's lexer does not know the preprocessor tokens ``##`` (paste) or
+    ``...`` (variadic), emitting them as separate ``#`` or ``.`` tokens. We
+    rejoin them only when the pieces are immediately adjacent, so ``a ## b``
+    pastes but ``a # # b`` does not, and ``...`` is recognized but ``. . .``
+    is not.
+    """
+    out = []
     i = 0
-    while i < len(tokens) - 2:
-        if (tokens[i].kind == token_kinds.pound
-                and tokens[i + 1].kind == token_kinds.identifier
-                and tokens[i + 1].content == "include"
-                and tokens[i + 2].kind == token_kinds.include_file):
+    n = len(tokens)
 
-            # Replace tokens[i] -> tokens[i+2] with preprocessed contents of
-            # the included file.
-            try:
-                file, filename = read_file(tokens[i + 2].content, this_file)
-                new_tokens = process(lexer.tokenize(file, filename), filename)
-                processed += new_tokens
+    def adj(a, b):
+        return a.r and b.r and b.r.start.col == a.r.end.col + 1
 
-            except IOError:
-                error_collector.add(CompilerError(
-                    "unable to read included file",
-                    tokens[i + 2].r
-                ))
-
+    while i < n:
+        t = tokens[i]
+        n1 = tokens[i + 1] if i + 1 < n else None
+        n2 = tokens[i + 2] if i + 2 < n else None
+        if (is_punct(t, ".") and n1 is not None and is_punct(n1, ".")
+                and n2 is not None and is_punct(n2, ".")
+                and adj(t, n1) and adj(n1, n2)):
+            out.append(Token(token_kinds.dot, "...", rep="...", r=t.r))
             i += 3
-
+        elif (is_punct(t, "#") and n1 is not None and is_punct(n1, "#")
+                and adj(t, n1)):
+            out.append(Token(token_kinds.pound, "##", rep="##", r=t.r))
+            i += 2
         else:
-            processed.append(tokens[i])
+            out.append(t)
+            i += 1
+    return out
+
+
+def _string_token(text, r):
+    """Build a string-literal token whose contents are `text`."""
+    esc = text.replace("\\", "\\\\").replace('"', '\\"')
+    toks = _relex('"' + esc + '"', r)
+    return toks[0] if toks else Token(token_kinds.string, [0], rep='""', r=r)
+
+
+class _PP:
+    """A token paired with the set of macro names it may not be expanded by."""
+
+    __slots__ = ("tok", "hide")
+
+    def __init__(self, tok, hide=frozenset()):
+        self.tok = tok
+        self.hide = hide
+
+
+class _Macro:
+    def __init__(self, name, func_like, params, variadic, body):
+        self.name = name
+        self.func_like = func_like
+        self.params = params          # list of parameter names
+        self.variadic = variadic      # bool; if so, last logical arg is va
+        self.body = body              # list of Token
+
+
+# ---------------------------------------------------------------------------
+# Preprocessor
+# ---------------------------------------------------------------------------
+
+class _Preprocessor:
+    def __init__(self, macros):
+        self.macros = macros
+
+    def run(self, tokens, this_file):
+        lines = self._group_lines(tokens)
+        out = []
+        pending = []          # active non-directive tokens awaiting expansion
+        cond = []             # stack of condition frames
+
+        def emitting():
+            return all(f["active"] for f in cond)
+
+        def flush():
+            if pending:
+                out.extend(self._expand_line(pending, this_file))
+                pending.clear()
+
+        for line in lines:
+            if line and line[0].kind is token_kinds.pound:
+                flush()
+                self._directive(line, cond, out, this_file, emitting)
+            elif emitting():
+                pending.extend(line)
+        flush()
+
+        if cond:
+            error_collector.add(CompilerError("unterminated #if", None))
+        return out
+
+    @staticmethod
+    def _group_lines(tokens):
+        """Group tokens into source lines using their start line numbers."""
+        lines = []
+        cur = []
+        cur_line = None
+        for t in tokens:
+            if getattr(t, "logical_line", None) is not None:
+                ln = t.logical_line
+            else:
+                ln = t.r.start.line if t.r and t.r.start else cur_line
+            if cur and ln != cur_line:
+                lines.append(cur)
+                cur = []
+            cur.append(t)
+            cur_line = ln
+        if cur:
+            lines.append(cur)
+        return lines
+
+    # -- directives --------------------------------------------------------
+
+    def _directive(self, line, cond, out, this_file, emitting):
+        if len(line) < 2:
+            return  # null directive '#'
+        name = spell(line[1])  # 'if'/'else' are C keywords, not identifiers
+        rest = line[2:]
+        active = emitting()
+
+        if name in ("if", "ifdef", "ifndef"):
+            if not active:
+                cond.append({"active": False, "taken": True,
+                             "seen_else": False, "parent": False})
+                return
+            if name == "if":
+                val = self._eval_cond(rest, line[0].r)
+            else:
+                want = (name == "ifdef")
+                defined = bool(rest) and ident_name(rest[0]) in self.macros
+                val = (defined == want)
+            cond.append({"active": val, "taken": val,
+                         "seen_else": False, "parent": True})
+
+        elif name == "elif":
+            if not cond:
+                error_collector.add(CompilerError("#elif without #if",
+                                                  line[0].r))
+                return
+            f = cond[-1]
+            if f["seen_else"]:
+                error_collector.add(CompilerError("#elif after #else",
+                                                  line[0].r))
+            if not f["parent"] or f["taken"]:
+                f["active"] = False
+            else:
+                f["active"] = self._eval_cond(rest, line[0].r)
+                f["taken"] = f["taken"] or f["active"]
+
+        elif name == "else":
+            if not cond:
+                error_collector.add(CompilerError("#else without #if",
+                                                  line[0].r))
+                return
+            f = cond[-1]
+            f["seen_else"] = True
+            f["active"] = f["parent"] and not f["taken"]
+            f["taken"] = True
+
+        elif name == "endif":
+            if not cond:
+                error_collector.add(CompilerError("#endif without #if",
+                                                  line[0].r))
+                return
+            cond.pop()
+
+        elif not active:
+            return  # all remaining directives are inert when not emitting
+
+        elif name == "define":
+            self._do_define(rest, line[0].r)
+
+        elif name == "undef":
+            if rest and ident_name(rest[0]):
+                self.macros.pop(ident_name(rest[0]), None)
+
+        elif name == "include":
+            self._do_include(rest, this_file, out)
+
+        elif name == "error":
+            msg = " ".join(spell(t) for t in rest)
+            error_collector.add(CompilerError("#error " + msg, line[0].r))
+
+        elif name in ("pragma", "line", "ident", "sccs", "warning"):
+            pass  # ignored
+
+        # Unknown directives are silently ignored (lenient).
+
+    def _do_define(self, rest, r):
+        rest = _coalesce(rest)  # rejoin ## and ... that the lexer split
+        if not rest or not ident_name(rest[0]):
+            error_collector.add(CompilerError("macro name missing", r))
+            return
+        name = ident_name(rest[0])
+
+        # Function-like only if '(' immediately follows the name with no space.
+        func_like = False
+        params = []
+        variadic = False
+        body_start = 1
+
+        if (len(rest) > 1 and is_punct(rest[1], "(")
+                and rest[1].r and rest[0].r
+                and rest[1].r.start.col == rest[0].r.end.col + 1):
+            func_like = True
+            i = 2
+            while i < len(rest) and not is_punct(rest[i], ")"):
+                if is_punct(rest[i], ","):
+                    i += 1
+                    continue
+                if is_punct(rest[i], "..."):
+                    variadic = True
+                    params.append("__VA_ARGS__")
+                elif ident_name(rest[i]):
+                    params.append(ident_name(rest[i]))
+                i += 1
+            body_start = i + 1  # skip ')'
+
+        body = rest[body_start:]
+        self.macros[name] = _Macro(name, func_like, params, variadic, body)
+
+    def _do_include(self, rest, this_file, out):
+        if not rest:
+            return
+        if rest[0].kind is token_kinds.include_file:
+            header = rest[0].content
+        else:
+            # Computed include: expand macros then read the spelling.
+            exp = self._expand_line(rest, this_file)
+            header = "".join(spell(t) for t in exp).strip()
+        try:
+            text, filename = read_file(header, this_file)
+            inc = lexer.tokenize(text, filename)
+            out.extend(process(inc, filename, self.macros))
+        except IOError:
+            error_collector.add(CompilerError(
+                "unable to read included file", rest[0].r))
+
+    # -- macro expansion ---------------------------------------------------
+
+    def _expand_line(self, tokens, this_file):
+        seq = [_PP(t) for t in tokens]
+        seq = self._expand(seq)
+        return [p.tok for p in seq]
+
+    def _expand(self, seq):
+        seq = list(seq)
+        out = []
+        i = 0
+        while i < len(seq):
+            p = seq[i]
+            nm = ident_name(p.tok)
+            m = self.macros.get(nm) if nm else None
+
+            # Dynamic predefined macros: __LINE__ expands to the line number of
+            # the token, __FILE__ to the source file name. They are not stored
+            # in self.macros because their value depends on position; a user
+            # #define of the same name (if any) takes precedence.
+            if m is None and nm in ("__LINE__", "__FILE__"):
+                pos = p.tok.r.start
+                if nm == "__LINE__":
+                    out.append(_PP(Token(token_kinds.number, str(pos.line),
+                                         r=p.tok.r)))
+                else:
+                    chars = [ord(c) for c in pos.file] + [0]
+                    out.append(_PP(Token(token_kinds.string, chars,
+                                         rep='"%s"' % pos.file, r=p.tok.r)))
+                i += 1
+                continue
+
+            if m is None or nm in p.hide:
+                out.append(p)
+                i += 1
+                continue
+
+            if not m.func_like:
+                repl = self._subst(m, [], p.hide | {nm}, p.tok.r)
+                seq[i:i + 1] = repl
+                continue
+
+            # Function-like: needs a '(' next.
+            j = i + 1
+            if j < len(seq) and is_punct(seq[j].tok, "("):
+                args, endj = self._gather_args(seq, j, m)
+                if args is None:
+                    out.append(p)
+                    i += 1
+                    continue
+                hs = (p.hide & seq[endj].hide) | {nm}
+                repl = self._subst(m, args, hs, p.tok.r)
+                seq[i:endj + 1] = repl
+                continue
+            else:
+                out.append(p)
+                i += 1
+        return out
+
+    @staticmethod
+    def _gather_args(seq, lparen_idx, m):
+        """Collect call arguments. Returns (args, rparen_index) or (None, _).
+
+        Arguments are collected as _PP objects so their hide sets are preserved
+        (per the C preprocessing algorithm, an argument is expanded as if it
+        formed the rest of the file, carrying the hide sets it had at the call
+        site; losing them causes a blue-painted self-referential macro inside an
+        already-expanded argument to be re-expanded incorrectly)."""
+        args = []
+        cur = []
+        depth = 0
+        i = lparen_idx
+        while i < len(seq):
+            pp = seq[i]
+            t = pp.tok
+            if is_punct(t, "("):
+                depth += 1
+                if depth > 1:
+                    cur.append(pp)
+            elif is_punct(t, ")"):
+                depth -= 1
+                if depth == 0:
+                    args.append(cur)
+                    break
+                cur.append(pp)
+            elif is_punct(t, ",") and depth == 1 and not (
+                    m.variadic and len(args) >= len(m.params) - 1):
+                args.append(cur)
+                cur = []
+            else:
+                cur.append(pp)
+            i += 1
+        else:
+            return None, i  # unbalanced
+
+        # FOO() with a single empty arg but macro takes no params -> no args.
+        if len(args) == 1 and not args[0] and not m.params:
+            args = []
+        # Pad missing args (e.g. empty variadic) with empty lists.
+        while len(args) < len(m.params):
+            args.append([])
+        return args, i
+
+    def _subst(self, m, args, hide, r):
+        """Substitute params into the macro body; handle # and ##.
+
+        Operates on _PP objects so each token keeps its own hide set; the new
+        hide set `hide` (HS') is UNIONED onto every result token at the end
+        (Prosser's hsadd). Argument tokens thus retain the hide sets accumulated
+        during their own expansion -- in particular a self-referential macro
+        that was blue-painted while expanding an argument stays painted, instead
+        of being wrongly re-expanded when the argument is reused."""
+        argmap = {name: args[i] for i, name in enumerate(m.params)
+                  if i < len(args)}
+
+        # Pass 1: substitute params and stringize, leaving ## markers.
+        items = []  # each: ("tok", _PP) or ("paste",) marker
+        body = m.body
+        i = 0
+        n = len(body)
+        expanded_cache = {}
+
+        def expanded(name):
+            if name not in expanded_cache:
+                # argmap values are already _PP (from _gather_args); expand
+                # them preserving hide sets.
+                raw = list(argmap.get(name, []))
+                expanded_cache[name] = self._expand(raw)
+            return expanded_cache[name]
+
+        while i < n:
+            t = body[i]
+            nm = ident_name(t)
+            nxt = body[i + 1] if i + 1 < n else None
+            nxt_nm = ident_name(nxt) if nxt else None
+
+            if is_punct(t, "#") and nxt_nm in argmap:
+                text = " ".join(spell(x.tok) for x in argmap.get(nxt_nm, []))
+                items.append(("tok", _PP(_string_token(text, r))))
+                i += 2
+                continue
+
+            if is_punct(t, "##"):
+                # GNU extension: `, ## __VA_ARGS__` deletes the preceding comma
+                # when the variadic argument is empty. (When it is non-empty,
+                # the normal paste below relexes `,x` back into `,` `x`, which
+                # is the desired juxtaposition, so only the empty case is
+                # special.)
+                if (m.variadic and nxt_nm == m.params[-1]
+                        and not argmap.get(nxt_nm)):
+                    if (items and items[-1][0] == "tok"
+                            and is_punct(items[-1][1].tok, ",")):
+                        items.pop()
+                    i += 2
+                    continue
+                items.append(("paste",))
+                i += 1
+                continue
+
+            adjacent_paste = (is_punct(nxt, "##") if nxt else False) or \
+                             (bool(items) and items[-1] == ("paste",))
+
+            if nm in argmap:
+                if adjacent_paste:
+                    sub = argmap.get(nm, [])      # raw _PP, for pasting
+                else:
+                    sub = expanded(nm)            # fully expanded _PP
+                for x in sub:
+                    items.append(("tok", x))
+                i += 1
+                continue
+
+            items.append(("tok", _PP(t)))         # body token: fresh hide
             i += 1
 
-    return processed + tokens[i:]
+        # Pass 2: resolve ## pastes.
+        result = []  # list of _PP
+        k = 0
+        while k < len(items):
+            it = items[k]
+            if it[0] == "paste":
+                right = None
+                if k + 1 < len(items) and items[k + 1][0] == "tok":
+                    right = items[k + 1][1]
+                    k += 1
+                if result and right is not None:
+                    left = result.pop()
+                    pasted = _relex(spell(left.tok) + spell(right.tok), r)
+                    result.extend(_PP(t) for t in pasted)
+                elif right is not None:
+                    result.append(right)
+                # else: paste with empty operand -> drop
+            else:
+                result.append(it[1])
+            k += 1
+
+        # hsadd: union HS' onto every result token, preserving each token's
+        # own accumulated hide set.
+        return [_PP(p.tok, p.hide | hide) for p in result]
+
+    # -- #if constant-expression evaluation --------------------------------
+
+    def _eval_cond(self, tokens, r):
+        # 1) Resolve `defined X` / `defined(X)` before macro expansion.
+        resolved = []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if ident_name(t) == "defined":
+                j = i + 1
+                paren = j < len(tokens) and is_punct(tokens[j], "(")
+                if paren:
+                    j += 1
+                name = ident_name(tokens[j]) if j < len(tokens) else None
+                val = 1 if (name and name in self.macros) else 0
+                resolved.append(_num_token(val, t.r))
+                i = j + (2 if paren else 1)
+                continue
+            resolved.append(t)
+            i += 1
+
+        # 2) Macro-expand the remainder.
+        expanded = [p.tok for p in self._expand([_PP(t) for t in resolved])]
+
+        # 3) Map remaining identifiers/keywords to 0; keep numbers/operators.
+        spells = []
+        for t in expanded:
+            if (t.kind is token_kinds.number
+                    or t.kind is token_kinds.char_string):
+                spells.append(spell(t))
+            elif is_ident(t) or t.kind in token_kinds.keyword_kinds:
+                spells.append("0")
+            else:
+                spells.append(spell(t))
+
+        try:
+            val = _ConstExpr(spells).parse()
+        except _PPExprError as e:
+            error_collector.add(CompilerError(
+                "invalid #if expression: " + str(e), r))
+            return False
+        return val != 0
+
+
+class _PPExprError(Exception):
+    pass
+
+
+class _ConstExpr:
+    """Recursive-descent evaluator for #if integer constant expressions."""
+
+    # Binary operators by precedence (low to high).
+    _LEVELS = [
+        {"||"}, {"&&"}, {"|"}, {"^"}, {"&"},
+        {"==", "!="}, {"<", "<=", ">", ">="}, {"<<", ">>"},
+        {"+", "-"}, {"*", "/", "%"},
+    ]
+
+    def __init__(self, spells):
+        self.toks = spells
+        self.i = 0
+
+    def parse(self):
+        if not self.toks:
+            raise _PPExprError("empty expression")
+        v = self._ternary()
+        if self.i != len(self.toks):
+            raise _PPExprError("trailing tokens")
+        return v
+
+    def _peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else None
+
+    def _eat(self, s=None):
+        t = self._peek()
+        if t is None:
+            raise _PPExprError("unexpected end")
+        if s is not None and t != s:
+            raise _PPExprError("expected " + s)
+        self.i += 1
+        return t
+
+    def _ternary(self):
+        c = self._binary(0)
+        if self._peek() == "?":
+            self._eat("?")
+            a = self._ternary()
+            self._eat(":")
+            b = self._ternary()
+            return a if c != 0 else b
+        return c
+
+    def _binary(self, level):
+        if level >= len(self._LEVELS):
+            return self._unary()
+        left = self._binary(level + 1)
+        while self._peek() in self._LEVELS[level]:
+            op = self._eat()
+            right = self._binary(level + 1)
+            left = self._apply(op, left, right)
+        return left
+
+    @staticmethod
+    def _apply(op, a, b):
+        if op == "||":
+            return 1 if (a != 0 or b != 0) else 0
+        if op == "&&":
+            return 1 if (a != 0 and b != 0) else 0
+        if op == "|":
+            return a | b
+        if op == "^":
+            return a ^ b
+        if op == "&":
+            return a & b
+        if op == "==":
+            return 1 if a == b else 0
+        if op == "!=":
+            return 1 if a != b else 0
+        if op == "<":
+            return 1 if a < b else 0
+        if op == "<=":
+            return 1 if a <= b else 0
+        if op == ">":
+            return 1 if a > b else 0
+        if op == ">=":
+            return 1 if a >= b else 0
+        if op == "<<":
+            return a << b
+        if op == ">>":
+            return a >> b
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op == "/":
+            if b == 0:
+                raise _PPExprError("division by zero")
+            return -(-a // b) if (a < 0) ^ (b < 0) else a // b
+        if op == "%":
+            if b == 0:
+                raise _PPExprError("modulo by zero")
+            q = -(-a // b) if (a < 0) ^ (b < 0) else a // b
+            return a - b * q
+        raise _PPExprError("bad operator " + op)
+
+    def _unary(self):
+        t = self._peek()
+        if t == "+":
+            self._eat()
+            return self._unary()
+        if t == "-":
+            self._eat()
+            return -self._unary()
+        if t == "!":
+            self._eat()
+            return 0 if self._unary() != 0 else 1
+        if t == "~":
+            self._eat()
+            return ~self._unary()
+        return self._primary()
+
+    def _primary(self):
+        t = self._eat()
+        if t == "(":
+            v = self._ternary()
+            self._eat(")")
+            return v
+        try:
+            return parse_c_int(t)
+        except (ValueError, IndexError):
+            raise _PPExprError("bad token " + repr(t))
+
+
+# ---------------------------------------------------------------------------
+# Include file resolution
+# ---------------------------------------------------------------------------
+
+_extra_include_dirs = []
+
+
+def set_include_dirs(dirs):
+    """Set additional `-I` include directories searched by read_file."""
+    global _extra_include_dirs
+    _extra_include_dirs = list(dirs or [])
 
 
 def read_file(include_file, this_file):
@@ -55,12 +781,25 @@ def read_file(include_file, this_file):
     this_file - location of the current file being preprocessed. used for
     locating quoted headers.
     """
-
+    name = include_file[1:-1]
+    bundled = pathlib.Path(__file__).parent.joinpath("include").joinpath(name)
+    extra = [pathlib.Path(d).joinpath(name) for d in _extra_include_dirs]
+    candidates = []
     if include_file[0] == '"':
-        path = pathlib.Path(this_file).parent.joinpath(include_file[1:-1])
-    else:  # path is an include file
-        path = pathlib.Path(__file__).parent\
-            .joinpath("include").joinpath(include_file[1:-1])
+        # Quoted: the including file's directory, then -I dirs, then ShivyC's
+        # bundled fallback headers.
+        candidates.append(pathlib.Path(this_file).parent.joinpath(name))
+        candidates.extend(extra)
+        candidates.append(bundled)
+    else:
+        # Angle-bracket: -I dirs first, so a real libc's headers (provided via
+        # -I, e.g. musl) take precedence over ShivyC's bundled fallback stubs.
+        candidates.extend(extra)
+        candidates.append(bundled)
 
-    with open(str(path)) as file:
-        return file.read(), str(path)
+    for path in candidates:
+        if path.exists():
+            with open(str(path)) as file:
+                return file.read(), str(path)
+
+    raise IOError(f"could not find include file {include_file}")

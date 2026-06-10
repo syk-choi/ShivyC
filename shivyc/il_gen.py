@@ -20,12 +20,19 @@ class ILCode:
         """Initialize IL code."""
         self.commands = {}
         self.cur_func = None
+        self.long_double_taint = {}
 
         self.label_num = 0
 
         self.static_inits = {}
+        self.static_block_inits = {}
         self.literals = {}
+        self.float_literals = {}
         self.string_literals = {}
+        # Stable asm labels for string literals that are referenced as address
+        # constants in static initializers (e.g. `static char *p = "x";`).
+        self.string_literal_names = {}
+        self._str_lit_counter = 0
 
     def copy(self):
         """Make copy of this object.
@@ -38,11 +45,29 @@ class ILCode:
         new.commands = {name: self.commands[name].copy()
                         for name in self.commands}
         new.cur_func = self.cur_func
+        new.long_double_taint = dict(self.long_double_taint)
         self.label_num = self.label_num
         self.static_inits = self.static_inits.copy()
+        new.static_block_inits = self.static_block_inits.copy()
         self.literals = self.literals.copy()
+        new.float_literals = self.float_literals.copy()
         self.string_literals = self.string_literals.copy()
+        new.string_literal_names = self.string_literal_names.copy()
+        new._str_lit_counter = self._str_lit_counter
         return new
+
+    def intern_static_string(self, chars):
+        """Register a string literal and return a stable asm label for it, for
+        use as an address constant in a static initializer (so e.g.
+        `static char *p = "x";` can point at the emitted bytes)."""
+        import shivyc.ctypes as ctypes
+        from shivyc.ctypes import ArrayCType
+        il_value = ILValue(ArrayCType(ctypes.char, len(chars)))
+        self.register_string_literal(il_value, chars)
+        self._str_lit_counter += 1
+        name = "__strlit_s%d" % self._str_lit_counter
+        self.string_literal_names[il_value] = name
+        return name
 
     def start_func(self, func):
         """Start a new function in the IL code.
@@ -75,6 +100,11 @@ class ILCode:
         il_value.literal = IntegerLiteral(value)
         self.literals[il_value] = value
 
+    def register_float_literal(self, il_value, value):
+        """Register a floating-point literal IL value."""
+        il_value.literal = FloatLiteral(value)
+        self.float_literals[il_value] = float(value)
+
     def register_string_literal(self, il_value, chars):
         """Register a string literal IL value.
 
@@ -92,6 +122,14 @@ class ILCode:
         init_val - Numeric value to initialize `il_value` to
         """
         self.static_inits[il_value] = init_val
+
+    def static_initialize_block(self, il_value, entries, total_size):
+        """Initialize an aggregate static value from constant entries.
+
+        entries - list of (byte_offset, size, value) for the constant scalars
+        total_size - total size of the object in bytes (gaps are zero-filled)
+        """
+        self.static_block_inits[il_value] = (entries, total_size)
 
     def get_label(self):
         """Return a unique label identifier string."""
@@ -137,6 +175,12 @@ class IntegerLiteral(_Literal):
         super().__init__(int(val))
 
 
+class FloatLiteral(_Literal):
+    """Class for floating-point literals."""
+    def __init__(self, val):
+        super().__init__(float(val))
+
+
 class StringLiteral(_Literal):
     """Class for string literals."""
     def __init__(self, val):
@@ -149,7 +193,7 @@ class SymbolTable:
     This object stores variable names, types, typedefs, and maintains
     information on the variable linkages and storage durations.
     """
-    Tables = namedtuple('Tables', ['vars', 'structs'])
+    Tables = namedtuple('Tables', ['vars', 'structs', 'enums'])
 
     # Definition statuses
     UNDEFINED = 1
@@ -192,11 +236,18 @@ class SymbolTable:
         # ILValue -> name
         self.names = {}
 
+        # Stable assembly labels for objects with static storage. Internal
+        # (file/function static) objects get a unique suffix assigned once and
+        # cached, so the address taken in a static initializer and the object's
+        # own definition use the same label.
+        self._asm_names = {}
+        self._asm_name_counter = 0
+
         self.new_scope()
 
     def new_scope(self):
         """Initialize a new scope for the symbol table."""
-        self.tables.append(self.Tables(dict(), dict()))
+        self.tables.append(self.Tables(dict(), dict(), dict()))
 
     def end_scope(self):
         """End the most recently started scope."""
@@ -209,7 +260,7 @@ class SymbolTable:
 
         name (str) - Identifier name to search for.
         """
-        for table, _ in self.tables[::-1]:
+        for table, _, _ in self.tables[::-1]:
             if name in table:
                 return table[name]
 
@@ -291,13 +342,42 @@ class SymbolTable:
         self.names[var] = name
         return var
 
+    def asm_name(self, var):
+        """Return the stable assembly label for an object with storage.
+
+        External objects use their plain name; internal/static objects get a
+        unique suffix assigned once and cached, so the label is identical
+        wherever the object is defined or its address is taken."""
+        base = self.names[var]
+        if self.linkage_type.get(var) == self.EXTERNAL:
+            return base
+        if var not in self._asm_names:
+            self._asm_name_counter += 1
+            self._asm_names[var] = "%s.%d" % (base, self._asm_name_counter)
+        return self._asm_names[var]
+
+    def lookup_enum_const(self, name):
+        """Return the integer value of an enum constant, or None."""
+        for _, _, enums in self.tables[::-1]:
+            if name in enums:
+                return enums[name]
+        return None
+
+    def add_enum_const(self, identifier, value):
+        """Register an enumerator name with its integer value."""
+        name = identifier.content
+        if name in self.tables[-1].enums or name in self.tables[-1].vars:
+            err = f"redefinition of '{name}'"
+            raise CompilerError(err, identifier.r)
+        self.tables[-1].enums[name] = value
+
     def lookup_struct_union(self, tag):
         """Looks up for struct or union by tag name and returns
         its ctype object.
 
         If not found, returns None.
         """
-        for _, structs in self.tables[::-1]:
+        for _, structs, _ in self.tables[::-1]:
             if tag in structs: return structs[tag]
 
     def add_struct_union(self, tag, ctype):
@@ -375,11 +455,48 @@ class Context:
         self.continue_label = None
         self.return_type = None
         self.is_global = False
+        # Collector for the enclosing switch statement (or None). Has `.cases`
+        # (list of (value, label)) and `.default` (label or None).
+        self.switch = None
+        # Number of named parameters of the enclosing variadic function, or
+        # None when not inside a variadic function. Used by va_start.
+        self.vararg_named = None
+        # Per-function map of goto label name -> IL label (shared by reference
+        # across context copies within a function body).
+        self.labels = None
+        # When the enclosing function returns a struct larger than 16 bytes
+        # (SysV "memory" class), this holds the hidden result-pointer ILValue
+        # that `return X` must write through. None otherwise.
+        self.sret_ptr = None
+
+    def set_sret_ptr(self, ptr):
+        """Return copy of self recording the hidden struct-return pointer."""
+        c = copy(self)
+        c.sret_ptr = ptr
+        return c
+
+    def set_labels(self, labels):
+        """Return copy of self with the function's goto-label map set."""
+        c = copy(self)
+        c.labels = labels
+        return c
 
     def set_global(self, val):
         """Return copy of self with is_global set to given value."""
         c = copy(self)
         c.is_global = val
+        return c
+
+    def set_switch(self, switch):
+        """Return copy of self with the enclosing switch collector set."""
+        c = copy(self)
+        c.switch = switch
+        return c
+
+    def set_vararg_named(self, n):
+        """Return copy of self recording the named-parameter count."""
+        c = copy(self)
+        c.vararg_named = n
         return c
 
     def set_break(self, lab):

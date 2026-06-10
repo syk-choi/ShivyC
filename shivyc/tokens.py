@@ -34,6 +34,44 @@ class TokenKind:
         """Return the representation of this token kind."""
         return self.text_repr
 
+    def __reduce__(self):
+        """Pickle a TokenKind as a reference to its module-level singleton.
+
+        Token kinds are singletons compared by identity throughout the
+        compiler, so a naive pickle (which would create a fresh copy) would
+        break those comparisons when an AST is loaded from the cache. We
+        instead pickle by a stable name and look the singleton back up.
+        """
+        _build_kind_registry()
+        return (_kind_by_name, (self._regname,))
+
+
+# Registry mapping a stable name ("<module>:<attr>") to each TokenKind
+# singleton, used to round-trip token kinds through pickle (see __reduce__).
+_NAME_TO_KIND = None
+
+
+def _build_kind_registry():
+    global _NAME_TO_KIND
+    if _NAME_TO_KIND is not None:
+        return
+    import importlib
+    _NAME_TO_KIND = {}
+    for modname in ("shivyc.token_kinds", "shivyc.tokens"):
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError:
+            continue
+        for attr, val in vars(mod).items():
+            if isinstance(val, TokenKind) and not hasattr(val, "_regname"):
+                val._regname = modname + ":" + attr
+                _NAME_TO_KIND[val._regname] = val
+
+
+def _kind_by_name(name):
+    _build_kind_registry()
+    return _NAME_TO_KIND[name]
+
 
 class Token:
     """Single unit element of the input as produced by the tokenizer.
@@ -56,6 +94,8 @@ class Token:
         self.content = content if content else str(self.kind)
         self.rep = rep
         self.r = r
+        # True for wide (L-prefixed) string/char literals.
+        self.wide = False
 
     def __repr__(self):  # pragma: no cover
         return self.content
@@ -63,3 +103,30 @@ class Token:
     def __str__(self):
         """Return the token content."""
         return self.rep if self.rep else self.content
+
+
+def parse_c_int(s):
+    """Parse a C integer-constant spelling into a Python int.
+
+    Handles hexadecimal (0x), binary (0b), octal (leading 0), and decimal,
+    with optional u/U and l/L suffixes (in any order). Also accepts a simple
+    character constant like 'A'.
+    """
+    s = s.strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        inner = s[1:-1]
+        if inner.startswith("\\"):
+            esc = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92,
+                   "'": 39, '"': 34}
+            return esc.get(inner[1:], ord(inner[-1]) if inner[1:] else 0)
+        return ord(inner) if inner else 0
+
+    # Strip integer suffixes.
+    core = s.rstrip("uUlL")
+    if core[:2] in ("0x", "0X"):
+        return int(core, 16)
+    if core[:2] in ("0b", "0B"):
+        return int(core, 2)
+    if len(core) > 1 and core[0] == "0":
+        return int(core, 8)
+    return int(core or "0", 10)

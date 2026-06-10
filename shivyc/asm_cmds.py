@@ -75,6 +75,20 @@ class Comment:
         return "\t// " + self.msg
 
 
+class Raw:
+    """A raw, pre-formatted assembly line (already in Intel syntax).
+
+    Used for instruction sequences (e.g. SIMD bit-packing) that do not map
+    onto the size-parameterized _ASMCommand model.
+    """
+
+    def __init__(self, text):  # noqa: D102
+        self.text = text
+
+    def __str__(self):  # noqa: D102
+        return "\t" + self.text
+
+
 class Label:
     """Class for label."""
 
@@ -82,7 +96,8 @@ class Label:
         self.label = label
 
     def __str__(self):  # noqa: D102
-        return self.label + ":"
+        from shivyc.spots import mangle_symbol
+        return mangle_symbol(self.label) + ":"
 
 
 class Lea:
@@ -171,6 +186,12 @@ class Cqo(_ASMCommand): name = "cqo"  # noqa: D101
 class Xor(_ASMCommand): name = "xor"  # noqa: D101
 
 
+class And(_ASMCommand): name = "and"  # noqa: D101
+
+
+class Or(_ASMCommand): name = "or"  # noqa: D101
+
+
 class Cmp(_ASMCommand): name = "cmp"  # noqa: D101
 
 
@@ -189,4 +210,36 @@ class Ret(_ASMCommand): name = "ret"  # noqa: D101
 class Sar(_ASMCommandMultiSize): name = "sar"  # noqa: D101
 
 
+class Shr(_ASMCommandMultiSize): name = "shr"  # noqa: D101
+
+
 class Sal(_ASMCommandMultiSize): name = "sal"  # noqa: D101
+
+
+class Movsd(_ASMCommand): name = "movsd"        # noqa: D101
+class Movss(_ASMCommand): name = "movss"        # noqa: D101
+class Cvtsi2sd(_ASMCommand): name = "cvtsi2sd"  # noqa: D101
+class Cvtsi2ss(_ASMCommand): name = "cvtsi2ss"  # noqa: D101
+class Cvttsd2si(_ASMCommand): name = "cvttsd2si"  # noqa: D101
+class Cvttss2si(_ASMCommand): name = "cvttss2si"  # noqa: D101
+class Cvtsd2ss(_ASMCommand): name = "cvtsd2ss"  # noqa: D101
+class Cvtss2sd(_ASMCommand): name = "cvtss2sd"  # noqa: D101
+
+
+# SSE scalar floating-point arithmetic.
+class Addsd(_ASMCommand): name = "addsd"  # noqa: D101
+class Addss(_ASMCommand): name = "addss"  # noqa: D101
+class Subsd(_ASMCommand): name = "subsd"  # noqa: D101
+class Subss(_ASMCommand): name = "subss"  # noqa: D101
+class Mulsd(_ASMCommand): name = "mulsd"  # noqa: D101
+class Mulss(_ASMCommand): name = "mulss"  # noqa: D101
+class Divsd(_ASMCommand): name = "divsd"  # noqa: D101
+class Divss(_ASMCommand): name = "divss"  # noqa: D101
+
+
+class Jp(_JumpCommand): name = "jp"   # noqa: D101  (jump if parity/unordered)
+class Ucomisd(_ASMCommand): name = "ucomisd"  # noqa: D101
+class Ucomiss(_ASMCommand): name = "ucomiss"  # noqa: D101
+
+
+class Xorps(_ASMCommand): name = "xorps"  # noqa: D101

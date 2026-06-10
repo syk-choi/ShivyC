@@ -41,9 +41,15 @@ def tokenize(code, filename):
     join_extended_lines(lines)
 
     in_comment = False
-    for line in lines:
+    for logical_line, line in enumerate(lines):
         try:
             line_tokens, in_comment = tokenize_line(line, in_comment)
+            for t in line_tokens:
+                # Physical line numbers (in t.r) are kept for diagnostics, but
+                # backslash-newline continuations have already been spliced, so
+                # tag the logical line for the preprocessor's directive
+                # grouping.
+                t.logical_line = logical_line
             tokens += line_tokens
         except CompilerError as e:
             error_collector.add(e)
@@ -133,14 +139,20 @@ def tokenize_line(line, in_comment):
         symbol_kind = match_symbol_kind_at(line, chunk_end)
         next_symbol_kind = match_symbol_kind_at(line, chunk_end + 1)
 
+        # Comment delimiters must be recognized from the raw characters, not
+        # from matched symbol kinds: match_symbol_kind_at is greedy, so e.g.
+        # the `*=` after `/` in `/*=...` would hide the `*` and the `/*` would
+        # not be seen as a comment start (likewise `/=` in `//=...`).
+        cur_c = line[chunk_end].c
+        next_c = line[chunk_end + 1].c if chunk_end + 1 < len(line) else ""
+
         # Set include_line flag True as soon as a `#include` is detected.
         if match_include_command(tokens):
             include_line = True
 
         if in_comment:
             # If next characters end the comment...
-            if (symbol_kind == token_kinds.star
-                    and next_symbol_kind == token_kinds.slash):
+            if cur_c == "*" and next_c == "/":
                 in_comment = False
                 chunk_start = chunk_end + 2
                 chunk_end = chunk_start
@@ -151,14 +163,12 @@ def tokenize_line(line, in_comment):
 
         # If next characters start a comment, process previous chunk and set
         # in_comment to true.
-        elif (symbol_kind == token_kinds.slash
-                and next_symbol_kind == token_kinds.star):
+        elif cur_c == "/" and next_c == "*":
             add_chunk(line[chunk_start:chunk_end], tokens)
             in_comment = True
 
         # If next two characters are //, we skip the rest of this line.
-        elif (symbol_kind == token_kinds.slash
-                and next_symbol_kind == token_kinds.slash):
+        elif cur_c == "/" and next_c == "/":
             break
 
         # Skip spaces and process previous chunk.
@@ -196,6 +206,11 @@ def tokenize_line(line, in_comment):
                 kind = token_kinds.char_string
                 add_null = False
 
+            # A pending chunk immediately before the quote may be a literal
+            # prefix. `L` marks a wide (wchar_t) string/char literal.
+            prefix = chunk_to_str(line[chunk_start:chunk_end])
+            wide = prefix == "L"
+
             chars, end = read_string(line, chunk_end + 1, quote_str, add_null)
             rep = chunk_to_str(line[chunk_end:end + 1])
             r = Range(line[chunk_end].p, line[end].p)
@@ -203,17 +218,27 @@ def tokenize_line(line, in_comment):
             if kind == token_kinds.char_string and len(chars) == 0:
                 err = "empty character constant"
                 error_collector.add(CompilerError(err, r))
-            elif kind == token_kinds.char_string and len(chars) > 1:
-                err = "multiple characters in character constant"
-                error_collector.add(CompilerError(err, r))
+            # A character constant with more than one character is valid C
+            # (C11 6.4.4.4p10) with an implementation-defined integer value;
+            # the bytes are packed (see the parser). Not an error. This also
+            # keeps lexing tolerant of `'...'` appearing in the text of a
+            # directive inside a skipped conditional group (e.g. CPython's
+            # `# error C 'size_t' size should be ...`), which the lexer scans
+            # before the preprocessor discards the inactive group.
 
-            tokens.append(Token(kind, chars, rep, r=r))
+            tok = Token(kind, chars, rep, r=r)
+            tok.wide = wide
+            tokens.append(tok)
 
             chunk_start = end + 1
             chunk_end = chunk_start
 
         # If next character is another symbol, add previous chunk and then
         # add the symbol.
+        elif symbol_kind and _continues_number(line, chunk_start,
+                                                chunk_end):
+            chunk_end += 1
+
         elif symbol_kind:
             symbol_start_index = chunk_end
             symbol_end_index = chunk_end + len(symbol_kind.text_repr) - 1
@@ -248,6 +273,23 @@ def chunk_to_str(chunk):
     return - string representation of the list of Tagged characters
     """
     return "".join(c.c for c in chunk)
+
+
+def _continues_number(line, chunk_start, chunk_end):
+    """Whether the symbol at chunk_end continues a floating constant."""
+    chunk = "".join(c.c for c in line[chunk_start:chunk_end])
+    ch = line[chunk_end].c
+    if ch == ".":
+        if chunk and chunk[0].isdigit():
+            return True
+        if (not chunk and chunk_end + 1 < len(line)
+                and line[chunk_end + 1].c.isdigit()):
+            return True
+        return False
+    if ch in "+-":
+        return bool(chunk) and chunk[0].isdigit() and chunk[-1] in "eEpP" and (
+            chunk[-1] in "pP" or not chunk.lower().startswith("0x"))
+    return False
 
 
 def match_symbol_kind_at(content, start):
@@ -417,8 +459,12 @@ def add_chunk(chunk, tokens):
                 token_kinds.identifier, identifier_name, r=range))
             return
 
-        descrip = f"unrecognized token at '{chunk_to_str(chunk)}'"
-        raise CompilerError(descrip, range)
+        # No keyword/number/identifier matched. Rather than failing now, emit
+        # an `unrecognized` token carrying the text. The preprocessor discards
+        # it in dead branches and renders it in #error messages; if it reaches
+        # the parser in live code, the parser reports it then.
+        tokens.append(Token(
+            token_kinds.unrecognized, chunk_to_str(chunk), r=range))
 
 
 def match_keyword_kind(token_repr):
@@ -439,12 +485,42 @@ def match_keyword_kind(token_repr):
 def match_number_string(token_repr):
     """Return a string that represents the given constant number.
 
+    Recognizes C integer constants: decimal, hexadecimal (0x), binary (0b),
+    and octal (leading 0), each with optional unsigned/long suffixes
+    (any combination of u/U and l/L). The original spelling is returned so the
+    value can be parsed downstream.
+
     token_repr - List of Tagged characters.
     returns (str, or None) - String representation of the number.
 
     """
     token_str = chunk_to_str(token_repr)
-    return token_str if token_str.isdigit() else None
+    if _FLOAT_CONST_RE.fullmatch(token_str):
+        return token_str
+    if _INT_CONST_RE.fullmatch(token_str):
+        return token_str
+    return None
+
+
+_FLOAT_CONST_RE = re.compile(
+    r"(?:0[xX](?:[0-9a-fA-F]*\.[0-9a-fA-F]+|[0-9a-fA-F]+\.?)[pP][+-]?[0-9]+"
+    r"|(?:[0-9]*\.[0-9]+|[0-9]+\.)(?:[eE][+-]?[0-9]+)?"
+    r"|[0-9]+[eE][+-]?[0-9]+)"
+    r"[fFlL]?")
+
+
+def is_float_constant(spelling):
+    """Return whether `spelling` is a floating (not integer) constant."""
+    return bool(_FLOAT_CONST_RE.fullmatch(spelling))
+
+
+# C integer constant: hex / binary / octal / decimal, with optional integer
+# suffixes (u, l, ll, ul, ull, ... in any order).
+_INT_CONST_RE = re.compile(
+    r"(?:0[xX][0-9a-fA-F]+"      # hexadecimal
+    r"|0[bB][01]+"               # binary (GNU extension)
+    r"|[0-9]+)"                  # decimal or octal (leading 0)
+    r"[uUlL]*")                  # optional integer suffixes
 
 
 def match_identifier_name(token_repr):
