@@ -29,8 +29,41 @@ def parse_func_definition(index):
     specs, index = parse_decl_specifiers(index)
     decl, index = parse_declarator(index)
 
+    # Determine the function's name so __func__ can resolve to it inside the
+    # body. Walk the declarator to its leaf Identifier.
+    name_node = decl
+    while not isinstance(name_node, decl_nodes.Identifier):
+        name_node = name_node.child
+    func_name = (name_node.identifier.content
+                 if name_node.identifier else "")
+
+    # A parameter name may legally shadow a file-scope typedef inside the
+    # body (e.g. CPython's clinic code names a parameter `string`, while
+    # `typedef PyObject *string;` exists at file scope). Open a scope for the
+    # body and record each named parameter as a non-typedef symbol so that
+    # uses of the name in the body parse as identifiers, not type names.
+    p.symbols.new_scope()
+    func_node = decl
+    while func_node is not None and not isinstance(
+            func_node, decl_nodes.Function):
+        func_node = getattr(func_node, "child", None)
+    if func_node is not None:
+        for param in func_node.args:
+            pdecl = param.decls[0] if param.decls else None
+            while pdecl is not None and not isinstance(
+                    pdecl, decl_nodes.Identifier):
+                pdecl = getattr(pdecl, "child", None)
+            if pdecl is not None and pdecl.identifier is not None:
+                p.symbols.add_symbol(pdecl.identifier, False)
+
     from shivyc.parser.statement import parse_compound_statement
-    body, index = parse_compound_statement(index)
+    prev_func_name = p.cur_func_name
+    p.cur_func_name = func_name
+    try:
+        body, index = parse_compound_statement(index)
+    finally:
+        p.cur_func_name = prev_func_name
+        p.symbols.end_scope()
 
     root = decl_nodes.Root(specs, [decl])
     return general_nodes.Declaration(root, body), index
@@ -117,15 +150,65 @@ def parse_decls_inits(index, parse_inits=True):
 
     decls = []
     inits = []
+    bitfields = []
+    asm_regs = []
 
     while True:
+        # A struct/union member may be a bitfield: `decl : width` (named) or
+        # `: width` (anonymous, no declarator). `parse_inits` is false exactly
+        # for struct/union member lists, so we only look for bitfields there.
+        if not parse_inits and token_is(index, token_kinds.colon):
+            from shivyc.parser.expression import parse_conditional
+            colon_tok = p.tokens[index]
+            width, index = parse_conditional(index + 1)
+            anon = decl_nodes.Identifier(None)
+            anon.r = colon_tok.r
+            decls.append(anon)
+            inits.append(None)
+            bitfields.append(width)
+            asm_regs.append(None)
+            if token_is(index, token_kinds.comma):
+                index += 1
+                continue
+            else:
+                break
+
         node, index = parse_declarator(index, is_typedef)
         decls.append(node)
 
+        # GCC asm-register binding: `register T v __asm__("reg")` (the prelude
+        # rewrites __asm__ to the `asm` identifier). Record the register name
+        # so the variable can be pinned for inline-asm operands (used by
+        # musl's syscall wrappers, e.g. `register long r10 __asm__("r10")`).
+        if (token_is(index, token_kinds.identifier)
+                and p.tokens[index].content == "asm"
+                and token_is(index + 1, token_kinds.open_paren)
+                and token_is(index + 2, token_kinds.string)):
+            from shivyc.parser.statement import _asm_string
+            regstr, after = _asm_string(index + 2)
+            after = match_token(after, token_kinds.close_paren,
+                                ParserError.GOT)
+            asm_regs.append(regstr)
+            index = after
+        else:
+            asm_regs.append(None)
+
+        if not parse_inits and token_is(index, token_kinds.colon):
+            from shivyc.parser.expression import parse_conditional
+            width, index = parse_conditional(index + 1)
+            bitfields.append(width)
+            inits.append(None)
+            if token_is(index, token_kinds.comma):
+                index += 1
+                continue
+            else:
+                break
+        else:
+            bitfields.append(None)
+
         if token_is(index, token_kinds.equals) and parse_inits:
-            # Parse initializer expression
-            from shivyc.parser.expression import parse_assignment
-            expr, index = parse_assignment(index + 1)
+            # Parse initializer expression or brace initializer.
+            expr, index = parse_initializer(index + 1)
             inits.append(expr)
         else:
             inits.append(None)
@@ -138,7 +221,7 @@ def parse_decls_inits(index, parse_inits=True):
 
     index = match_token(index, token_kinds.semicolon, ParserError.AFTER)
 
-    node = decl_nodes.Root(specs, decls, inits)
+    node = decl_nodes.Root(specs, decls, inits, bitfields, asm_regs)
     return node, index
 
 
@@ -162,7 +245,8 @@ def parse_decl_specifiers(index, _spec_qual=False):
 
     type_quals = {token_kinds.const_kw}
 
-    storage_specs = {token_kinds.auto_kw, token_kinds.static_kw,
+    storage_specs = {token_kinds.auto_kw, token_kinds.register_kw,
+                     token_kinds.static_kw,
                      token_kinds.extern_kw, token_kinds.typedef_kw}
 
     specs = []
@@ -190,6 +274,12 @@ def parse_decl_specifiers(index, _spec_qual=False):
         # Parse a union specifier if there is one.
         elif not type_spec_class and token_is(index, token_kinds.union_kw):
             node, index = parse_union_spec(index + 1)
+            specs.append(node)
+            type_spec_class = STRUCT
+
+        # Parse an enum specifier if there is one.
+        elif not type_spec_class and token_is(index, token_kinds.enum_kw):
+            node, index = parse_enum_spec(index + 1)
             specs.append(node)
             type_spec_class = STRUCT
 
@@ -247,24 +337,40 @@ def parse_parameter_list(index):
     """
     # List of decl_nodes arguments
     params = []
+    variadic = False
 
-    # No arguments
-    if token_is(index, token_kinds.close_paren):
-        return params, index
+    # Parameter names live in their own scope: a parameter whose name matches
+    # a typedef (e.g. `void f(int destructor)` where `destructor` is a typedef)
+    # must not leak out and shadow that typedef in the enclosing scope. The
+    # scope is closed on every return path. Typedef *resolution* for parameter
+    # types still works because is_typedef falls through to outer scopes.
+    p.symbols.new_scope()
+    try:
+        # No arguments
+        if token_is(index, token_kinds.close_paren):
+            return params, variadic, index
 
-    while True:
-        # Try parsing declaration specifiers, quit if no more exist
-        specs, index = parse_decl_specifiers(index)
-        decl, index = parse_declarator(index)
-        params.append(decl_nodes.Root(specs, [decl]))
+        while True:
+            # A trailing `...` marks the function as variadic.
+            if token_is(index, token_kinds.dots):
+                variadic = True
+                index += 1
+                break
 
-        # Expect a comma, and break if there isn't one
-        if token_is(index, token_kinds.comma):
-            index += 1
-        else:
-            break
+            # Try parsing declaration specifiers, quit if no more exist
+            specs, index = parse_decl_specifiers(index)
+            decl, index = parse_declarator(index)
+            params.append(decl_nodes.Root(specs, [decl]))
 
-    return params, index
+            # Expect a comma, and break if there isn't one
+            if token_is(index, token_kinds.comma):
+                index += 1
+            else:
+                break
+
+        return params, variadic, index
+    finally:
+        p.symbols.end_scope()
 
 
 @add_range
@@ -356,6 +462,15 @@ def _find_decl_end(index):
     guaranteed to return the correct end point. Returns an index one
     greater than the last index in this declarator.
     """
+    # A GCC `asm("...")` clause after the declarator (an asm label or a
+    # `register T v __asm__("reg")` register binding) is not part of the
+    # declarator grammar. Stop before it so the caller can consume it; the
+    # naive identifier rule below would otherwise swallow `asm` and its
+    # parenthesized argument as if they were declarator tokens.
+    if (token_is(index, token_kinds.identifier)
+            and p.tokens[index].content == "asm"
+            and token_is(index + 1, token_kinds.open_paren)):
+        return index
     if (token_is(index, token_kinds.star)
          or token_is(index, token_kinds.identifier)
          or token_is(index, token_kinds.const_kw)):
@@ -418,10 +533,22 @@ def _parse_declarator_raw(start, end, is_typedef):
         if open_sq == end - 2:
             num_el = None
         else:
-            num_el, index = parse_expression(open_sq + 1)
-            if index != end - 1:
-                err = "unexpected token in array size"
-                raise_error(err, index, ParserError.AFTER)
+            # C99 parameter array hints: `[static N]`, `[const N]`,
+            # `[static const N]`, etc. These qualifiers don't change ShivyC's
+            # representation (such a parameter is just a pointer), so skip them
+            # before reading the size expression.
+            size_start = open_sq + 1
+            while size_start < end - 1 and (
+                    token_is(size_start, token_kinds.static_kw)
+                    or token_is(size_start, token_kinds.const_kw)):
+                size_start += 1
+            if size_start == end - 1:
+                num_el = None
+            else:
+                num_el, index = parse_expression(size_start)
+                if index != end - 1:
+                    err = "unexpected token in array size"
+                    raise_error(err, index, ParserError.AFTER)
 
         return decl_nodes.Array(
             num_el, _parse_declarator(start, open_sq, is_typedef))
@@ -440,10 +567,11 @@ def _try_parse_func_decl(start, end, is_typedef=False):
 
     open_paren = _find_pair_backward(end - 1)
     with log_error():
-        params, index = parse_parameter_list(open_paren + 1)
+        params, variadic, index = parse_parameter_list(open_paren + 1)
         if index == end - 1:
             return decl_nodes.Function(
-                params, _parse_declarator(start, open_paren, is_typedef))
+                params, _parse_declarator(start, open_paren, is_typedef),
+                variadic)
 
     return None
 
@@ -488,3 +616,101 @@ def _parse_struct_union_spec(index, node_type):
 
     r = start_r + p.tokens[index - 1].r
     return node_type(name, members, r), index
+
+
+def parse_initializer(index):
+    """Parse an initializer: either an assignment expression or a brace list.
+    """
+    if token_is(index, token_kinds.open_brack):
+        return parse_init_list(index)
+    from shivyc.parser.expression import parse_assignment
+    return parse_assignment(index)
+
+
+def parse_enum_spec(index):
+    """Parse an enum specifier.
+
+    index - index right past the `enum` keyword.
+
+    Returns a decl_nodes.Enum node and the index past the specifier. The node
+    holds the optional tag and a list of (name_token, value_expr_or_None)
+    enumerators (or None if this is just a reference like `enum E`).
+    """
+    start_r = p.tokens[index - 1].r
+
+    name = None
+    if token_is(index, token_kinds.identifier):
+        name = p.tokens[index]
+        index += 1
+
+    enumerators = None
+    if token_is(index, token_kinds.open_brack):
+        index += 1
+        enumerators = []
+        # An empty enum `{}` is rejected below via the name/members check.
+        while not token_is(index, token_kinds.close_brack):
+            ename = p.tokens[index]
+            index = match_token(index, token_kinds.identifier,
+                                ParserError.GOT)
+            value = None
+            if token_is(index, token_kinds.equals):
+                from shivyc.parser.expression import parse_conditional
+                value, index = parse_conditional(index + 1)
+            enumerators.append((ename, value))
+            if token_is(index, token_kinds.comma):
+                index += 1
+            else:
+                break
+        index = match_token(index, token_kinds.close_brack, ParserError.GOT)
+
+    if name is None and enumerators is None:
+        err = "expected identifier or enumerator list"
+        raise_error(err, index, ParserError.AFTER)
+
+    r = start_r + p.tokens[index - 1].r
+    return decl_nodes.Enum(name, enumerators, r), index
+
+
+def parse_init_list(index):
+    """Parse a brace-enclosed initializer list into a decl_nodes.InitList."""
+    from shivyc.parser.expression import parse_assignment, parse_conditional
+    start = index
+    index = match_token(index, token_kinds.open_brack, ParserError.GOT)
+
+    items = []
+    # Allow an empty initializer list (a GNU/C23 extension some code uses).
+    if not token_is(index, token_kinds.close_brack):
+        while True:
+            designators = []
+            while (token_is(index, token_kinds.dot)
+                   or token_is(index, token_kinds.open_sq_brack)):
+                if token_is(index, token_kinds.dot):
+                    index += 1
+                    name = p.tokens[index]
+                    index = match_token(
+                        index, token_kinds.identifier, ParserError.GOT)
+                    designators.append(("member", name))
+                else:
+                    index += 1
+                    idx_expr, index = parse_conditional(index)
+                    index = match_token(
+                        index, token_kinds.close_sq_brack, ParserError.GOT)
+                    designators.append(("index", idx_expr))
+            if designators:
+                index = match_token(
+                    index, token_kinds.equals, ParserError.AFTER)
+
+            init, index = parse_initializer(index)
+            items.append((designators, init))
+
+            if token_is(index, token_kinds.comma):
+                index += 1
+                # Trailing comma before the closing brace is allowed.
+                if token_is(index, token_kinds.close_brack):
+                    break
+            else:
+                break
+
+    r = p.tokens[start].r
+    index = match_token(index, token_kinds.close_brack, ParserError.GOT)
+    return decl_nodes.InitList(items, r), index

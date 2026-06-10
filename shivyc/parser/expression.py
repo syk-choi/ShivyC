@@ -40,7 +40,12 @@ def parse_assignment(index):
                   token_kinds.minusequals: tree.MinusEquals,
                   token_kinds.starequals: tree.StarEquals,
                   token_kinds.divequals: tree.DivEquals,
-                  token_kinds.modequals: tree.ModEquals}
+                  token_kinds.modequals: tree.ModEquals,
+                  token_kinds.orequals: tree.OrEquals,
+                  token_kinds.andequals: tree.AndEquals,
+                  token_kinds.xorequals: tree.XorEquals,
+                  token_kinds.lshiftequals: tree.LShiftEquals,
+                  token_kinds.rshiftequals: tree.RShiftEquals}
 
     if kind in node_types:
         right, index = parse_assignment(index + 1)
@@ -51,9 +56,20 @@ def parse_assignment(index):
 
 @add_range
 def parse_conditional(index):
-    """Parse a conditional expression."""
-    # TODO: Parse ternary operator
-    return parse_logical_or(index)
+    """Parse a conditional (ternary) expression.
+
+    conditional-expression:
+        logical-OR-expression
+        logical-OR-expression ? expression : conditional-expression
+    """
+    cond, index = parse_logical_or(index)
+    if token_is(index, token_kinds.question):
+        op = p.tokens[index]
+        then_expr, index = parse_expression(index + 1)
+        index = match_token(index, token_kinds.colon, ParserError.AFTER)
+        else_expr, index = parse_conditional(index)
+        return tree.Conditional(cond, then_expr, else_expr, op), index
+    return cond, index
 
 
 @add_range
@@ -67,10 +83,33 @@ def parse_logical_or(index):
 @add_range
 def parse_logical_and(index):
     """Parse logical and expression."""
-    # TODO: Implement bitwise operators here.
+    return parse_series(
+        index, parse_bit_or,
+        {token_kinds.bool_and: tree.BoolAnd})
+
+
+@add_range
+def parse_bit_or(index):
+    """Parse bitwise or (|) expression."""
+    return parse_series(
+        index, parse_bit_xor,
+        {token_kinds.bitor: tree.BitOr})
+
+
+@add_range
+def parse_bit_xor(index):
+    """Parse bitwise xor (^) expression."""
+    return parse_series(
+        index, parse_bit_and,
+        {token_kinds.bitxor: tree.BitXor})
+
+
+@add_range
+def parse_bit_and(index):
+    """Parse bitwise and (&) expression."""
     return parse_series(
         index, parse_equality,
-        {token_kinds.bool_and: tree.BoolAnd})
+        {token_kinds.amp: tree.BitAnd})
 
 
 @add_range
@@ -129,12 +168,27 @@ def parse_cast(index):
         parse_abstract_declarator, parse_spec_qual_list)
 
     with log_error():
+        start = index
         match_token(index, token_kinds.open_paren, ParserError.AT)
         specs, index = parse_spec_qual_list(index + 1)
         node, index = parse_abstract_declarator(index)
         match_token(index, token_kinds.close_paren, ParserError.AT)
 
         decl_node = decl_nodes.Root(specs, [node])
+
+        # A '{' after the parenthesized type-name makes this a C99 compound
+        # literal, not a cast.
+        if token_is(index + 1, token_kinds.open_brack):
+            from shivyc.parser.declaration import parse_initializer
+            init, index = parse_initializer(index + 1)
+            cl = tree.CompoundLiteral(decl_node, init)
+            # A compound literal is a postfix-expression operand, so it may be
+            # subscripted, called, or have a member accessed (e.g. musl's
+            # `(size_t[3]){0,a,b}[whence]`). Give it a range before applying
+            # postfix operators, which read it.
+            cl.r = p.tokens[start].r + p.tokens[index - 1].r
+            return _parse_postfix_ops(cl, index)
+
         expr_node, index = parse_cast(index + 1)
         return tree.Cast(decl_node, expr_node), index
 
@@ -173,6 +227,73 @@ def parse_unary(index):
         decl_node = decl_nodes.Root(specs, [node])
 
         return tree.SizeofType(decl_node), index + 1
+    elif token_is(index, token_kinds.alignof_kw):
+        # C11 _Alignof requires a parenthesized type-name; we also accept an
+        # expression operand (the GCC __alignof__ form) for leniency.
+        from shivyc.parser.declaration import (
+            parse_abstract_declarator, parse_spec_qual_list)
+
+        match_token(index + 1, token_kinds.open_paren, ParserError.AFTER)
+        with log_error():
+            specs, after = parse_spec_qual_list(index + 2)
+            node, after = parse_abstract_declarator(after)
+            after = match_token(after, token_kinds.close_paren,
+                                ParserError.AT)
+            decl_node = decl_nodes.Root(specs, [node])
+            return tree.AlignofType(decl_node), after
+
+        node, index = parse_unary(index + 1)
+        return tree.AlignofExpr(node), index
+    elif (token_is(index, token_kinds.identifier)
+          and p.tokens[index].content == "__builtin_va_arg"):
+        from shivyc.parser.declaration import (
+            parse_abstract_declarator, parse_spec_qual_list)
+
+        match_token(index + 1, token_kinds.open_paren, ParserError.AFTER)
+        ap_node, index = parse_assignment(index + 2)
+        index = match_token(index, token_kinds.comma, ParserError.AFTER)
+        specs, index = parse_spec_qual_list(index)
+        node, index = parse_abstract_declarator(index)
+        index = match_token(index, token_kinds.close_paren, ParserError.AT)
+        decl_node = decl_nodes.Root(specs, [node])
+        return tree.VaArg(ap_node, decl_node), index
+    elif (token_is(index, token_kinds.identifier)
+          and p.tokens[index].content == "__builtin_offsetof"):
+        from shivyc.parser.declaration import (
+            parse_abstract_declarator, parse_spec_qual_list)
+
+        match_token(index + 1, token_kinds.open_paren, ParserError.AFTER)
+        specs, index = parse_spec_qual_list(index + 2)
+        node, index = parse_abstract_declarator(index)
+        decl_node = decl_nodes.Root(specs, [node])
+        index = match_token(index, token_kinds.comma, ParserError.AFTER)
+
+        # Member designator: identifier ( .identifier | [expr] )*
+        designator = []
+        ident = p.tokens[index]
+        if ident.kind is not token_kinds.identifier:
+            raise_error("expected member name in __builtin_offsetof",
+                        index, ParserError.AT)
+        designator.append(("member", ident.content))
+        index += 1
+        while True:
+            if token_is(index, token_kinds.dot):
+                m = p.tokens[index + 1]
+                if m.kind is not token_kinds.identifier:
+                    raise_error("expected member name after '.'",
+                                index + 1, ParserError.AT)
+                designator.append(("member", m.content))
+                index += 2
+            elif token_is(index, token_kinds.open_sq_brack):
+                expr, index = parse_expression(index + 1)
+                index = match_token(
+                    index, token_kinds.close_sq_brack, ParserError.GOT)
+                designator.append(("index", expr))
+            else:
+                break
+
+        index = match_token(index, token_kinds.close_paren, ParserError.GOT)
+        return tree.OffsetofType(decl_node, designator), index
     else:
         return parse_postfix(index)
 
@@ -181,7 +302,13 @@ def parse_unary(index):
 def parse_postfix(index):
     """Parse postfix expression."""
     cur, index = parse_primary(index)
+    return _parse_postfix_ops(cur, index)
 
+
+def _parse_postfix_ops(cur, index):
+    """Apply any trailing postfix operators ([], ., ->, (), ++, --) to an
+    already-parsed primary expression `cur`. Shared by parse_postfix and by
+    compound literals (which may also be subscripted, e.g. `(int[]){..}[i]`)."""
     while True:
         old_range = cur.r
 
@@ -209,22 +336,32 @@ def parse_postfix(index):
             args = []
             index += 1
 
+            # Recognize the va_start address builtin: __builtin_va_start_addr()
+            if (isinstance(cur, tree.Identifier)
+                    and cur.identifier.content == "__builtin_va_start_addr"
+                    and token_is(index, token_kinds.close_paren)):
+                node = tree.VaStartAddr()
+                node.r = old_range + p.tokens[index].r
+                return node, index + 1
+
             if token_is(index, token_kinds.close_paren):
-                return tree.FuncCall(cur, args), index + 1
+                index += 1
+            else:
+                while True:
+                    arg, index = parse_assignment(index)
+                    args.append(arg)
 
-            while True:
-                arg, index = parse_assignment(index)
-                args.append(arg)
+                    if token_is(index, token_kinds.comma):
+                        index += 1
+                    else:
+                        break
 
-                if token_is(index, token_kinds.comma):
-                    index += 1
-                else:
-                    break
+                index = match_token(
+                    index, token_kinds.close_paren, ParserError.GOT)
 
-            index = match_token(
-                index, token_kinds.close_paren, ParserError.GOT)
-
-            return tree.FuncCall(cur, args), index
+            # Set cur and continue the loop so postfix operators can follow a
+            # call (e.g. f()->m, f()[i], f().m, callbacks like f()()).
+            cur = tree.FuncCall(cur, args)
 
         elif token_is(index, token_kinds.incr):
             index += 1
@@ -249,12 +386,30 @@ def parse_primary(index):
         return tree.Number(p.tokens[index]), index + 1
     elif (token_is(index, token_kinds.identifier)
           and not p.symbols.is_typedef(p.tokens[index])):
+        name = p.tokens[index].content
+        # C99 __func__ (and the GCC aliases) behave like a static const char[]
+        # holding the enclosing function's name.
+        if name in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+            fname = p.cur_func_name or ""
+            chars = [ord(c) for c in fname] + [0]
+            return tree.String(chars), index + 1
         return tree.Identifier(p.tokens[index]), index + 1
     elif token_is(index, token_kinds.string):
-        return tree.String(p.tokens[index].content), index + 1
+        return (tree.String(p.tokens[index].content, p.tokens[index].wide),
+                index + 1)
     elif token_is(index, token_kinds.char_string):
         chars = p.tokens[index].content
-        return tree.Number(chars[0]), index + 1
+        if len(chars) == 1:
+            value = chars[0]
+        else:
+            # Multi-character constant (C11 6.4.4.4p10): implementation-defined
+            # value. Match gcc -- pack bytes big-endian into an int, keep the
+            # low 32 bits, interpreted as a signed int. e.g. 'ab' -> 0x6162.
+            packed = 0
+            for ch in chars:
+                packed = ((packed << 8) | (ch & 0xFF)) & 0xFFFFFFFF
+            value = packed - 0x100000000 if packed >= 0x80000000 else packed
+        return tree.Number(value), index + 1
     else:
         raise_error("expected expression", index, ParserError.GOT)
 

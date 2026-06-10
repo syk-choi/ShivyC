@@ -16,10 +16,11 @@ the function cannot parse the entity from the tokens.
 """
 import shivyc.parser.utils as p
 import shivyc.tree.general_nodes as general_nodes
+import shivyc.token_kinds as token_kinds
 
 from shivyc.errors import error_collector
 from shivyc.parser.utils import (add_range, log_error, ParserError,
-                                 raise_error)
+                                 raise_error, token_is)
 from shivyc.parser.declaration import parse_declaration, parse_func_definition
 
 
@@ -31,6 +32,7 @@ def parse(tokens_to_parse):
     """
     p.best_error = None
     p.tokens = tokens_to_parse
+    p.cur_func_name = None
 
     with log_error():
         return parse_root(0)[0]
@@ -44,6 +46,12 @@ def parse_root(index):
     """Parse the given tokens into an AST."""
     items = []
     while True:
+        # A stray semicolon at file scope is an empty declaration; skip it.
+        # (Common after function-definition macros like FOO(...);)
+        if token_is(index, token_kinds.semicolon):
+            index += 1
+            continue
+
         with log_error():
             item, index = parse_func_definition(index)
             items.append(item)

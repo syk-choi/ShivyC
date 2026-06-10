@@ -1,7 +1,8 @@
 """Utilities for the parser."""
 
+from __future__ import annotations
+
 from contextlib import contextmanager
-import copy
 
 from shivyc.errors import CompilerError, Range
 
@@ -10,7 +11,11 @@ from shivyc.errors import CompilerError, Range
 # parser.py file, the main parse function sets this global variable to the
 # list of tokens. Then, all functions in the parser can reference this
 # variable rather than passing around the tokens list everywhere.
-tokens = None
+tokens: "list | None" = None
+
+# Name of the function whose body is currently being parsed, or None at file
+# scope. Used to resolve the C99 predefined identifier __func__.
+cur_func_name: "str | None" = None
 
 
 class SimpleSymbolTable:
@@ -21,25 +26,46 @@ class SimpleSymbolTable:
     declared identifier, the table records whether or not it is a type
     defnition.
     """
-    def __init__(self):
-        self.symbols = []
+    def __init__(self) -> None:
+        self.symbols: list = []
         self.new_scope()
 
-    def new_scope(self):
+    def new_scope(self) -> None:
         self.symbols.append({})
 
-    def end_scope(self):
+    def end_scope(self) -> None:
         self.symbols.pop()
 
-    def add_symbol(self, identifier, is_typedef):
+    def add_symbol(self, identifier, is_typedef: bool) -> None:
         self.symbols[-1][identifier.content] = is_typedef
 
-    def is_typedef(self, identifier):
-        name = identifier.content
+    def is_typedef(self, identifier) -> bool:
+        name: str = identifier.content
         for table in self.symbols[::-1]:
             if name in table:
                 return table[name]
         return False
+
+    def snapshot(self) -> list:
+        """Return a cheap, restorable copy of the table state.
+
+        Each scope maps an identifier name (str) to a typedef flag (bool);
+        both keys and values are immutable, so a shallow per-scope dict copy
+        is a fully correct backup. This deliberately avoids copy.deepcopy,
+        whose recursive object cloning dominated parse time and has no direct
+        C equivalent -- this explicit snapshot/restore does (a future
+        source-to-C transpiler can emit a plain loop of map copies).
+        """
+        return [dict(scope) for scope in self.symbols]
+
+    def restore(self, snap: list) -> None:
+        """Restore table state from a snapshot, in place.
+
+        The live object identity is preserved (no rebinding of the global),
+        which is also friendlier to a transpiler that fixes each variable's
+        type and identity.
+        """
+        self.symbols = [dict(scope) for scope in snap]
 
 
 symbols = SimpleSymbolTable()
@@ -111,7 +137,7 @@ class ParserError(CompilerError):
                 f"{message} after '{tokens[index - 1]}'", new_range)
 
 
-def raise_error(err, index, error_type):
+def raise_error(err: str, index: int, error_type: int) -> None:
     """Raise a parser error."""
     raise ParserError(err, index, tokens, error_type)
 
@@ -140,27 +166,31 @@ def log_error():
     """
     global best_error, symbols
 
-    # back up the global symbols table, so if parsing fails we can reset it
-    symbols_bak = copy.deepcopy(symbols)
+    # Back up the symbol table so a failed speculative parse can be undone.
+    # A shallow snapshot suffices (see SimpleSymbolTable.snapshot) and replaces
+    # the former copy.deepcopy, which recursively cloned the whole table on
+    # every speculative parse and dominated parse time.
+    symbols_bak: list = symbols.snapshot()
     try:
         yield
     except ParserError as e:
         if not best_error or e.amount_parsed >= best_error.amount_parsed:
             best_error = e
-        symbols = symbols_bak
+        symbols.restore(symbols_bak)
 
 
-def token_is(index, kind):
+def token_is(index: int, kind) -> bool:
     """Return true if the next token is of the given kind."""
     return len(tokens) > index and tokens[index].kind == kind
 
 
-def token_in(index, kinds):
+def token_in(index: int, kinds) -> bool:
     """Return true if the next token is in the given list/set of kinds."""
     return len(tokens) > index and tokens[index].kind in kinds
 
 
-def match_token(index, kind, message_type, message=None):
+def match_token(index: int, kind, message_type: int,
+                message: "str | None" = None) -> int:
     """Raise ParserError if tokens[index] is not of the expected kind.
 
     If tokens[index] is of the expected kind, returns index + 1.
@@ -177,10 +207,14 @@ def match_token(index, kind, message_type, message=None):
         raise ParserError(message, index, tokens, message_type)
 
 
-def token_range(start, end):
+def token_range(start: int, end: int):
     """Generate a range that encompasses tokens[start] to tokens[end-1]"""
-    start_index = min(start, len(tokens) - 1, end - 1)
-    end_index = min(end - 1, len(tokens) - 1)
+    # An empty translation unit (e.g. a file containing only comments) has no
+    # tokens and therefore no source range to point to.
+    if not tokens:
+        return None
+    start_index: int = max(0, min(start, len(tokens) - 1, end - 1))
+    end_index: int = max(0, min(end - 1, len(tokens) - 1))
     return tokens[start_index].r + tokens[end_index].r
 
 
@@ -191,8 +225,8 @@ def add_range(parse_func):
     the returned node has its range attribute set
 
     """
-    def parse_with_range(index, *args):
-        start_index = index
+    def parse_with_range(index: int, *args):
+        start_index: int = index
         node, end_index = parse_func(index, *args)
         node.r = token_range(start_index, end_index)
 
