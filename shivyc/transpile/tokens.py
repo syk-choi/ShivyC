@@ -29,5 +29,6 @@ class Token:
         self.wide: bool = False
         self.int_content: list[int] = []
         self.use_int_content: bool = False
+        self.logical_line: int = 0
         if len(content) > 0:
             self.content = content

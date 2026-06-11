@@ -18,6 +18,7 @@ struct Token {
     bool wide;
     IntList *int_content;
     bool use_int_content;
+    int logical_line;
 };
 
 TokenKind *TokenKind_new(const char *text_repr);
