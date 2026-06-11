@@ -62,3 +62,48 @@ footprints are disjoint: left and right share no registers
 - The generated routines are cooperative (save group footprint -> swap rsp ->
   restore other group). The same save-set is what a *preemptive* timer ISR would
   push for a thread of that group — the partition shrinks that frame too.
+
+## Preemptive timer path (IRQ0)
+
+`--emit-thread-switcher OUT.s` also writes `OUT.preempt.s`: the partition-aware
+*preemptive* timer path that replaces the generic `irq0 -> irq_common_stub`
+(which saves the full 15-register `interrupt_frame64`) at IDT vector 32.
+
+Instead it saves only the **running thread's group footprint**. The key: left
+and right footprints are disjoint, so the left timer ISR uses the right
+registers as scratch (dead for a left thread) and vice-versa -- no extra spills.
+
+```
+timer ISR saves the running group's footprint (left 4, right 4 GP regs)
+instead of all 9 on every tick
+```
+
+Control enters `timer_dispatch` (the gate target), which does
+`jmp [timer_vector]`; each ISR flips `timer_vector` to the other side before
+`iretq`, so the next tick is already specialized -- the choice is data, never a
+branch on thread kind.
+
+### Wiring it to the kernel (connects to the idt64 step)
+
+Link `OUT.preempt.s` with the embedded `idt64.c` / `idt64.S`, then install it:
+
+```c
+extern void timer_dispatch(void);
+extern void *cur_tcb, *next_tcb;
+extern void idt_set_handler(unsigned char vec, void *entry);  /* idt64.c */
+
+cur_tcb  = left_tcb;
+next_tcb = right_tcb;
+idt_set_handler(32, timer_dispatch);   /* IRQ0 -> specialized path */
+/* program the PIT, pic_enable_irq(0), then sti (kernel_main already does sti) */
+```
+
+`idt64.c` gained `idt_set_handler(vec, entry)` for exactly this -- pointing a
+vector straight at a raw asm entry, bypassing the generic stub.
+
+### TCB layout the switcher expects
+
+```
++0  saved rsp     +8  saved rip     +16 saved rflags
++24.. saved group GP registers (footprint order), then XMM (16B each)
+```
